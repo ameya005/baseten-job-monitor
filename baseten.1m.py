@@ -1,4 +1,4 @@
-#!/Users/ameyajoshi/.local/share/mise/installs/python/3.12.12/bin/python3
+#!/usr/bin/env python3
 # <swiftbar.hideAbout>true</swiftbar.hideAbout>
 # <swiftbar.hideRunInTerminal>true</swiftbar.hideRunInTerminal>
 # <swiftbar.hideDisablePlugin>true</swiftbar.hideDisablePlugin>
@@ -10,9 +10,15 @@ import re
 import subprocess
 import sys
 
-# Ensure mise shims are on PATH so truss is found
+# Ensure common tool directories are on PATH so truss is found
+_extra_paths = [
+    os.path.expanduser("~/.local/bin"),
+    os.path.expanduser("~/.local/share/mise/shims"),
+    "/opt/homebrew/bin",
+    "/usr/local/bin",
+]
 os.environ["PATH"] = (
-    os.path.expanduser("~/.local/share/mise/shims")
+    ":".join(p for p in _extra_paths if os.path.isdir(p))
     + ":"
     + os.environ.get("PATH", "")
 )
@@ -125,7 +131,7 @@ def short_status(status: str) -> str:
 def main():
     try:
         result = subprocess.run(
-            [os.path.expanduser("~/.local/share/mise/installs/pipx-truss/0.14.1/bin/truss"), "train", "view", "--non-interactive"],
+            ["truss", "train", "view", "--non-interactive"],
             capture_output=True,
             text=True,
             timeout=30,
