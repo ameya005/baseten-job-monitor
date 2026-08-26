@@ -11,7 +11,9 @@ A macOS menu bar plugin that monitors your [Baseten](https://www.baseten.co/) tr
   - 🔴 Failed
   - ⚫ Stopped / Completed
 - GPU count summary across active jobs
+- Launcher and elapsed runtime for each active job
 - Click any job to open it in the Baseten dashboard
+- Open the corresponding Weights & Biases run directly from the job menu
 - Copy job IDs to clipboard
 - Browse all training projects
 

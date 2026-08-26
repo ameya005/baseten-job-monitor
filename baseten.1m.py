@@ -7,8 +7,10 @@
 
 import os
 import re
+import shlex
 import subprocess
 import sys
+from datetime import datetime
 
 # Ensure common tool directories are on PATH so truss is found
 _extra_paths = [
@@ -23,6 +25,12 @@ os.environ["PATH"] = (
     + os.environ.get("PATH", "")
 )
 
+# truss uses Rich for tables; without a wide terminal it truncates every cell
+# (Job ID, Status, Instance Type, etc.) to ~7 chars and switches the active-jobs
+# section to a compact table that loses the "Training Job: <id>" headers our
+# parser keys off. Force a wide width so the per-job detail blocks render.
+os.environ["COLUMNS"] = "400"
+
 
 def strip_ansi(text: str) -> str:
     return re.sub(r"\x1b\[[0-9;]*m|\x1b\].*?\x07", "", text)
@@ -33,47 +41,136 @@ def strip_box_chars(text: str) -> str:
     return re.sub(r"[─│┌┐└┘├┤┬┴┼╭╮╰╯╶╴╷╵═║╔╗╚╝╠╣╦╩╬▪]", "", text)
 
 
-def parse_active_jobs(raw: str) -> list[dict]:
-    """Parse the 'Active Training Jobs' section from truss train view output."""
+def _split_box_row(line: str) -> list[str]:
+    """Split a Rich table row on │ separators and strip each cell."""
+    cells = [c.strip() for c in line.split("│")]
+    # Drop empty leading/trailing cells from the outer borders.
+    if cells and not cells[0]:
+        cells = cells[1:]
+    if cells and not cells[-1]:
+        cells = cells[:-1]
+    return cells
+
+
+def _parse_active_jobs_blocks(raw: str) -> list[dict]:
+    """Parse the legacy per-job 'Training Job: <id>' detail blocks (truss <=0.14)."""
     text = strip_ansi(raw)
     jobs = []
-
-    # Find each "Training Job: <id>" block
     blocks = re.split(r"Training Job:\s+(\S+)", text)
-    # blocks[0] is before first match, then alternating: id, content, id, content...
     for i in range(1, len(blocks), 2):
         job_id = blocks[i].strip()
         content = blocks[i + 1] if i + 1 < len(blocks) else ""
         content = strip_box_chars(content)
-
         job = {"job_id": job_id}
         for line in content.split("\n"):
             line = line.strip()
             if not line:
                 continue
-            # Parse "Key  │  Value" or "Key    Value" patterns
-            # After stripping box chars, it's "Key    Value"
             parts = re.split(r"\s{2,}", line, maxsplit=1)
             if len(parts) == 2:
-                key = parts[0].strip()
-                val = parts[1].strip()
+                key, val = parts[0].strip(), parts[1].strip()
                 if key and val and key != val:
                     job[key] = val
-
         if "Status" in job:
             jobs.append(job)
-
     return jobs
+
+
+def _parse_active_jobs_table(raw: str, projects: list[dict]) -> list[dict]:
+    """Parse the single 'Active Training Jobs' Rich table (truss >=0.17).
+
+    Columns: Job ID | Job Name | Project | Status | Instance Type | Created By | Created | Job Page
+    """
+    text = strip_ansi(raw)
+    idx = text.find("Active Training Jobs")
+    if idx < 0:
+        return []
+    section = text[idx:]
+
+    name_to_pid = {p["name"]: p["project_id"] for p in projects}
+
+    jobs = []
+    headers = None
+    for line in section.split("\n"):
+        if "│" not in line:
+            continue
+        cells = _split_box_row(line)
+        if not cells:
+            continue
+        if headers is None:
+            # Header rows can wrap (e.g. " " then "Job ID", "Job Name"...). Wait
+            # for the row that actually contains "Job ID".
+            if any("Job ID" in c for c in cells):
+                headers = cells
+            continue
+        # Data rows start with a 7-char alphanumeric job id.
+        if not re.fullmatch(r"[a-z0-9]{7}", cells[0]):
+            continue
+        row = dict(zip(headers, cells))
+        job = {
+            "job_id": row.get("Job ID", cells[0]),
+            "Job Name": row.get("Job Name", ""),
+            "Project Name": row.get("Project", ""),
+            "Status": row.get("Status", ""),
+            "Instance Type": row.get("Instance Type", ""),
+            "Created By": row.get("Created By", ""),
+            "Created": row.get("Created", ""),
+        }
+        job["Project ID"] = name_to_pid.get(job["Project Name"], "")
+        if job["Status"]:
+            jobs.append(job)
+    return jobs
+
+
+def parse_active_jobs(raw: str, projects: list = None) -> list[dict]:
+    """Parse the 'Active Training Jobs' section, supporting both truss formats."""
+    jobs = _parse_active_jobs_blocks(raw)
+    if jobs:
+        # Older format omits Project ID inside the per-job block in some versions;
+        # backfill from the projects table when possible.
+        if projects:
+            name_to_pid = {p["name"]: p["project_id"] for p in projects}
+            for j in jobs:
+                if not j.get("Project ID") and j.get("Project Name"):
+                    j["Project ID"] = name_to_pid.get(j["Project Name"], "")
+        return jobs
+    return _parse_active_jobs_table(raw, projects or [])
 
 
 def parse_projects(raw: str) -> list[dict]:
     """Parse the projects table to get project IDs and names."""
     text = strip_ansi(raw)
-    text = strip_box_chars(text)
+    # Do not let rows from the following jobs table masquerade as projects.
+    section = text.split("Active Training Jobs", 1)[0]
 
     projects = []
+    headers = None
+    for line in section.split("\n"):
+        if "│" not in line:
+            continue
+        cells = _split_box_row(line)
+        if not cells:
+            continue
+        if headers is None:
+            if any("Project ID" in c for c in cells):
+                headers = cells
+            continue
+        if not re.fullmatch(r"[a-z0-9]{7}", cells[0]):
+            continue
+        row = dict(zip(headers, cells))
+        projects.append({
+            "project_id": row.get("Project ID", cells[0]),
+            "name": row.get("Name", ""),
+            "latest_job_id": row.get("Latest Job ID", ""),
+        })
+
+    if projects:
+        return projects
+
+    # Fall back to whitespace parsing for older Truss output.
+    section = strip_box_chars(section)
     # Find lines that look like project rows (start with a project ID pattern)
-    for line in text.split("\n"):
+    for line in section.split("\n"):
         line = line.strip()
         # Project IDs are 7-char alphanumeric
         match = re.match(r"^([a-z0-9]{7})\s+(.+)", line)
@@ -128,6 +225,95 @@ def short_status(status: str) -> str:
     )
 
 
+def elapsed_time(created_at: str, now: datetime = None) -> str:
+    """Return a compact duration since a Truss `Created` timestamp."""
+    if not created_at:
+        return ""
+
+    value = created_at.strip()
+    if value.endswith("Z"):
+        value = value[:-1] + "+00:00"
+    elif value.endswith(" UTC"):
+        value = value[:-4] + "+00:00"
+
+    try:
+        created = datetime.fromisoformat(value)
+    except ValueError:
+        return ""
+
+    if now is None:
+        now = datetime.now(created.tzinfo) if created.tzinfo else datetime.now()
+    seconds = max(0, int((now - created).total_seconds()))
+    minutes = seconds // 60
+    hours, minutes = divmod(minutes, 60)
+    days, hours = divmod(hours, 24)
+
+    if days:
+        return f"{days}d {hours}h"
+    if hours:
+        return f"{hours}h {minutes}m"
+    if minutes:
+        return f"{minutes}m"
+    return "<1m"
+
+
+def parse_wandb_run_url(raw: str) -> str:
+    """Extract the first concrete W&B run URL from training logs."""
+    urls = re.findall(r"https://(?:www\.)?wandb\.ai/[^\s<>\"']+", strip_ansi(raw))
+    for url in urls:
+        url = url.rstrip(".,;:)]}")
+        if "/runs/" in url:
+            return url
+    return ""
+
+
+def notify(message: str, title: str = "Baseten Monitor") -> None:
+    """Show a macOS notification for a menu action result."""
+    message = message.replace('"', '\\"')
+    title = title.replace('"', '\\"')
+    subprocess.run(
+        [
+            "/usr/bin/osascript",
+            "-e",
+            f'display notification "{message}" with title "{title}"',
+        ],
+        capture_output=True,
+        timeout=5,
+    )
+
+
+def open_wandb_run(job_id: str) -> None:
+    """Resolve a job's W&B URL from its logs and open it in the browser."""
+    if not re.fullmatch(r"[a-z0-9]{7}", job_id):
+        notify(f"Invalid Baseten job ID: {job_id}")
+        return
+
+    try:
+        result = subprocess.run(
+            [
+                "truss",
+                "train",
+                "logs",
+                "--job-id",
+                job_id,
+                "--non-interactive",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=45,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        notify(f"Could not read logs for {job_id}")
+        return
+
+    url = parse_wandb_run_url(result.stdout + result.stderr)
+    if not url:
+        notify(f"No W&B run URL found in logs for {job_id}")
+        return
+
+    subprocess.run(["/usr/bin/open", url], capture_output=True, timeout=5)
+
+
 def main():
     try:
         result = subprocess.run(
@@ -155,11 +341,8 @@ def main():
         print("truss timed out after 30s")
         sys.exit(0)
 
-    jobs = parse_active_jobs(raw)
     projects = parse_projects(raw)
-
-    # Build project lookup
-    proj_lookup = {p["project_id"]: p for p in projects}
+    jobs = parse_active_jobs(raw, projects)
 
     # Count active
     running = [j for j in jobs if "RUNNING" in j.get("Status", "").upper()]
@@ -192,7 +375,9 @@ def main():
         project_id = job.get("Project ID", "")
         project_name = job.get("Project Name", "")
         instance = job.get("Instance Type", "")
+        created_by = job.get("Created By", "")
         created_at = job.get("Created", "")
+        elapsed = elapsed_time(created_at)
         emoji = status_emoji(status)
         short = short_status(status)
 
@@ -200,11 +385,23 @@ def main():
 
         gpu = parse_gpu_info(instance)
         gpu_label = f" [{gpu}]" if gpu else ""
-        print(f"{emoji} {job_name} — {short}{gpu_label} | href={url}")
+        elapsed_label = f" · {elapsed}" if elapsed else ""
+        print(f"{emoji} {job_name} — {short}{elapsed_label}{gpu_label} | href={url}")
         print(f"--Job ID: {job_id} | font=monospace size=12")
         print(f"--Instance: {instance} | size=12")
+        if created_by:
+            print(f"--Launched by: {created_by} | size=12")
+        if elapsed:
+            duration_name = "Running for" if "RUNNING" in status.upper() else "Elapsed"
+            print(f"--{duration_name}: {elapsed} | size=12")
         print(f"--Created: {created_at} | size=12")
-        print(f"--Open in Browser | href={url}")
+        print(f"--Open Baseten Logs | href={url}")
+        python = shlex.quote(sys.executable)
+        script = shlex.quote(os.path.abspath(__file__))
+        print(
+            f"--Open W&B Run | bash={python} param1={script} "
+            f"param2=--open-wandb param3={job_id} terminal=false refresh=false"
+        )
         print(f"--Copy Job ID | bash=/bin/bash param1=-c param2='echo -n {job_id} | pbcopy' terminal=false")
 
     # Show all projects
@@ -221,4 +418,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) == 3 and sys.argv[1] == "--open-wandb":
+        open_wandb_run(sys.argv[2])
+    else:
+        main()
