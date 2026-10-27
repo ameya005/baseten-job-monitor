@@ -42,7 +42,7 @@ The plugin is `monitor.py`. Click any section header (a box, the Mac, or the Bas
 
 ### This Mac
 
-- Computer name and chip, with CPU (from `top`, a real one-second sample), RAM, and disk on the data volume, in the same bar style as the dev boxes.
+- Computer name and chip, with CPU (from `top`, a real one-second sample), RAM, and disk on the data volume, in the same bar style as the dev boxes. The RAM bar shows **memory pressure** (from `memory_pressure`), not raw used/total, because macOS deliberately keeps "used" near 100% with compressed and cached pages; the used/total figure is still printed next to it.
 - The same grouped process table, so you can see what Cursor, your training scripts, or anything else is doing locally.
 - **Open Activity Monitor** in the submenu.
 

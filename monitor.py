@@ -1098,6 +1098,15 @@ def fetch_local_metrics(ident: dict) -> dict:
         used = _to_mb(used_v, used_u)
         total = ident.get("mem_total_mb") or used + _to_mb(unused_v, unused_u)
         m["mem_used_mb"], m["mem_total_mb"] = used, total
+    # macOS keeps "used" near 100% by design (compressed + cached pages), so
+    # memory pressure is the honest signal. memory_pressure reports free %.
+    try:
+        mp = subprocess.run(["/usr/bin/memory_pressure"], capture_output=True, text=True, timeout=5).stdout
+        free = re.search(r"free percentage:\s*(\d+)%", mp)
+        if free:
+            m["mem_pressure_pct"] = 100 - int(free.group(1))
+    except (OSError, subprocess.TimeoutExpired):
+        pass
     try:
         # The Data volume is where user files live; "/" is the small sealed system volume.
         df = subprocess.run(["/bin/df", "-k", "/System/Volumes/Data"], capture_output=True, text=True, timeout=5).stdout.splitlines()
@@ -1199,6 +1208,13 @@ def _pct(used: int | None, total: int | None) -> float | None:
     return 100.0 * used / total
 
 
+def _ram_pct(m: dict) -> float | None:
+    """RAM figure for summaries: memory pressure on macOS, used/total elsewhere."""
+    if m.get("mem_pressure_pct") is not None:
+        return float(m["mem_pressure_pct"])
+    return _pct(m.get("mem_used_mb"), m.get("mem_total_mb"))
+
+
 def _usage_color(pct: float | None) -> str:
     if pct is None:
         return GREY
@@ -1225,7 +1241,7 @@ def metrics_summary(m: dict) -> str:
     bits = []
     if m.get("cpu_pct") is not None:
         bits.append(f"CPU {m['cpu_pct']}%")
-    mem = _pct(m.get("mem_used_mb"), m.get("mem_total_mb"))
+    mem = _ram_pct(m)
     if mem is not None:
         bits.append(f"RAM {mem:.0f}%")
     utils = [g["util_pct"] for g in m.get("gpus", []) if g.get("util_pct") is not None]
@@ -1278,9 +1294,14 @@ def metrics_lines(m: dict, age: float) -> list[str]:
     ) if x)
     out.append(row("CPU ", cpu, tail + stale))
 
-    mem = _pct(m.get("mem_used_mb"), m.get("mem_total_mb"))
-    if mem is not None:
-        out.append(row("RAM ", mem, f"{_gb(m['mem_used_mb'])}/{_gb(m['mem_total_mb'])} GB"))
+    if m.get("mem_pressure_pct") is not None:
+        used = _pct(m.get("mem_used_mb"), m.get("mem_total_mb"))
+        detail = f"pressure · {_gb(m['mem_used_mb'])}/{_gb(m['mem_total_mb'])} GB used" if used is not None else "pressure"
+        out.append(row("RAM ", float(m["mem_pressure_pct"]), detail))
+    else:
+        mem = _pct(m.get("mem_used_mb"), m.get("mem_total_mb"))
+        if mem is not None:
+            out.append(row("RAM ", mem, f"{_gb(m['mem_used_mb'])}/{_gb(m['mem_total_mb'])} GB"))
     swap = _pct(m.get("swap_used_mb"), m.get("swap_total_mb"))
     if swap is not None and m.get("swap_used_mb", 0) > 0:
         out.append(row("Swap", swap, f"{_gb(m['swap_used_mb'])}/{_gb(m['swap_total_mb'])} GB"))
@@ -1364,7 +1385,7 @@ def _local_title(ident: dict, m: dict | None) -> str:
         bits = []
         if m.get("cpu_pct") is not None:
             bits.append(f"CPU {m['cpu_pct']}%")
-        mem = _pct(m.get("mem_used_mb"), m.get("mem_total_mb"))
+        mem = _ram_pct(m)
         if mem is not None:
             bits.append(f"RAM {mem:.0f}%")
         if bits:
