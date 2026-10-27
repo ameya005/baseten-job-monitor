@@ -4,11 +4,16 @@
 # <swiftbar.hideRunInTerminal>true</swiftbar.hideRunInTerminal>
 # <swiftbar.hideDisablePlugin>true</swiftbar.hideDisablePlugin>
 
-"""SwiftBar streaming plugin: live AWS EC2 dev box monitor.
+"""SwiftBar streaming plugin: Baseten training jobs, AWS EC2 dev boxes, and
+this Mac, all in one menu bar item.
 
-This plugin stays running. It polls EC2 for instance state once a minute and
-keeps one SSH session open per running box, which reports CPU, RAM, disk and
-GPU usage every ~2 seconds. The menu redraws every 2 seconds, like a tiny htop.
+This plugin stays running. Three background threads feed one menu:
+  * Baseten: `truss train view` once a minute.
+  * AWS: EC2 instance state once a minute, plus one SSH session per running
+    box that reports CPU, RAM, disk and GPU usage every ~2 seconds.
+  * Local: `top` / `ps` on this Mac every ~2 seconds.
+The menu redraws every 2 seconds, like a tiny htop. Click any section header
+(a job group, a box, or the Mac) to pin it to the menu bar.
 
 Security model:
   * The plugin never handles AWS credentials. Every AWS call goes through the
@@ -65,9 +70,11 @@ ALLOWED_KEYS = {
     "BTMON_DEV_BOXES",
     "BTMON_SSH_USER",
     "BTMON_SSH_KEY",
-    "BTMON_PINNED",   # instance ID or Name tag of the box shown in the menu bar
+    "BTMON_PINNED",   # instance ID / Name tag of a box, or "baseten" / "local"
 }
 # Credentials belong to the AWS CLI's own credential chain, never to this file.
+SPECIAL_PINS = {"baseten", "local"}   # non-EC2 things that can sit in the menu bar
+
 FORBIDDEN_KEYS = {
     "AWS_ACCESS_KEY_ID",
     "AWS_SECRET_ACCESS_KEY",
@@ -192,7 +199,7 @@ def load_config() -> dict:
                 ssh_key = ""
 
     pinned = values.get("BTMON_PINNED", "").strip()
-    if pinned and not (INSTANCE_ID_RE.fullmatch(pinned) or INSTANCE_NAME_RE.fullmatch(pinned)):
+    if pinned and pinned not in SPECIAL_PINS and not (INSTANCE_ID_RE.fullmatch(pinned) or INSTANCE_NAME_RE.fullmatch(pinned)):
         cfg["warnings"].append("Ignoring BTMON_PINNED: unexpected characters")
         pinned = ""
 
@@ -689,6 +696,20 @@ class State:
         self.metrics_err: dict[str, str] = {}
         self.streams: dict[str, MetricsStream] = {}
         self.last_poll = 0.0
+        self.bt = {"jobs": [], "projects": [], "error": "", "at": 0.0}
+        self.local_ident = local_identity()
+        self.local: dict | None = None
+        self.local_at = 0.0
+
+    def poll_baseten(self) -> None:
+        res = fetch_baseten()
+        with self.lock:
+            self.bt = {**res, "at": time.time()}
+
+    def poll_local(self) -> None:
+        m = fetch_local_metrics(self.local_ident)
+        with self.lock:
+            self.local, self.local_at = m, time.time()
 
     def set_metrics(self, box_id: str, m: dict) -> None:
         with self.lock:
@@ -735,7 +756,371 @@ class State:
                 "metrics": dict(self.metrics),
                 "metrics_err": dict(self.metrics_err),
                 "last_poll": self.last_poll,
+                "bt": dict(self.bt),
+                "local_ident": self.local_ident,
+                "local": self.local,
+                "local_at": self.local_at,
             }
+
+
+
+# --------------------------------------------------------------------------
+# Baseten training jobs (via the truss CLI)
+# --------------------------------------------------------------------------
+
+# truss uses Rich for tables; without a wide terminal it truncates every cell.
+os.environ["COLUMNS"] = "400"
+
+TRUSS_POLL_INTERVAL = 60   # seconds between `truss train view` calls
+TRUSS_TIMEOUT = 45
+
+def strip_ansi(text: str) -> str:
+    return re.sub(r"\x1b\[[0-9;]*m|\x1b\].*?\x07", "", text)
+
+
+def strip_box_chars(text: str) -> str:
+    # Remove Unicode box-drawing characters
+    return re.sub(r"[─│┌┐└┘├┤┬┴┼╭╮╰╯╶╴╷╵═║╔╗╚╝╠╣╦╩╬▪]", "", text)
+
+
+def _split_box_row(line: str) -> list[str]:
+    """Split a Rich table row on │ separators and strip each cell."""
+    cells = [c.strip() for c in line.split("│")]
+    # Drop empty leading/trailing cells from the outer borders.
+    if cells and not cells[0]:
+        cells = cells[1:]
+    if cells and not cells[-1]:
+        cells = cells[:-1]
+    return cells
+
+
+def _parse_active_jobs_blocks(raw: str) -> list[dict]:
+    """Parse the legacy per-job 'Training Job: <id>' detail blocks (truss <=0.14)."""
+    text = strip_ansi(raw)
+    jobs = []
+    blocks = re.split(r"Training Job:\s+(\S+)", text)
+    for i in range(1, len(blocks), 2):
+        job_id = blocks[i].strip()
+        content = blocks[i + 1] if i + 1 < len(blocks) else ""
+        content = strip_box_chars(content)
+        job = {"job_id": job_id}
+        for line in content.split("\n"):
+            line = line.strip()
+            if not line:
+                continue
+            parts = re.split(r"\s{2,}", line, maxsplit=1)
+            if len(parts) == 2:
+                key, val = parts[0].strip(), parts[1].strip()
+                if key and val and key != val:
+                    job[key] = val
+        if "Status" in job:
+            jobs.append(job)
+    return jobs
+
+
+def _parse_active_jobs_table(raw: str, projects: list[dict]) -> list[dict]:
+    """Parse the single 'Active Training Jobs' Rich table (truss >=0.17).
+
+    Columns: Job ID | Job Name | Project | Status | Instance Type | Created By | Created | Job Page
+    """
+    text = strip_ansi(raw)
+    idx = text.find("Active Training Jobs")
+    if idx < 0:
+        return []
+    section = text[idx:]
+
+    name_to_pid = {p["name"]: p["project_id"] for p in projects}
+
+    jobs = []
+    headers = None
+    for line in section.split("\n"):
+        if "│" not in line:
+            continue
+        cells = _split_box_row(line)
+        if not cells:
+            continue
+        if headers is None:
+            # Header rows can wrap (e.g. " " then "Job ID", "Job Name"...). Wait
+            # for the row that actually contains "Job ID".
+            if any("Job ID" in c for c in cells):
+                headers = cells
+            continue
+        # Data rows start with a 7-char alphanumeric job id.
+        if not re.fullmatch(r"[a-z0-9]{7}", cells[0]):
+            continue
+        row = dict(zip(headers, cells))
+        job = {
+            "job_id": row.get("Job ID", cells[0]),
+            "Job Name": row.get("Job Name", ""),
+            "Project Name": row.get("Project", ""),
+            "Status": row.get("Status", ""),
+            "Instance Type": row.get("Instance Type", ""),
+            "Created By": row.get("Created By", ""),
+            "Created": row.get("Created", ""),
+        }
+        job["Project ID"] = name_to_pid.get(job["Project Name"], "")
+        if job["Status"]:
+            jobs.append(job)
+    return jobs
+
+
+def parse_active_jobs(raw: str, projects: list = None) -> list[dict]:
+    """Parse the 'Active Training Jobs' section, supporting both truss formats."""
+    jobs = _parse_active_jobs_blocks(raw)
+    if jobs:
+        # Older format omits Project ID inside the per-job block in some versions;
+        # backfill from the projects table when possible.
+        if projects:
+            name_to_pid = {p["name"]: p["project_id"] for p in projects}
+            for j in jobs:
+                if not j.get("Project ID") and j.get("Project Name"):
+                    j["Project ID"] = name_to_pid.get(j["Project Name"], "")
+        return jobs
+    return _parse_active_jobs_table(raw, projects or [])
+
+
+def parse_projects(raw: str) -> list[dict]:
+    """Parse the projects table to get project IDs and names."""
+    text = strip_ansi(raw)
+    # Do not let rows from the following jobs table masquerade as projects.
+    section = text.split("Active Training Jobs", 1)[0]
+
+    projects = []
+    headers = None
+    for line in section.split("\n"):
+        if "│" not in line:
+            continue
+        cells = _split_box_row(line)
+        if not cells:
+            continue
+        if headers is None:
+            if any("Project ID" in c for c in cells):
+                headers = cells
+            continue
+        if not re.fullmatch(r"[a-z0-9]{7}", cells[0]):
+            continue
+        row = dict(zip(headers, cells))
+        projects.append({
+            "project_id": row.get("Project ID", cells[0]),
+            "name": row.get("Name", ""),
+            "latest_job_id": row.get("Latest Job ID", ""),
+        })
+
+    if projects:
+        return projects
+
+    # Fall back to whitespace parsing for older Truss output.
+    section = strip_box_chars(section)
+    # Find lines that look like project rows (start with a project ID pattern)
+    for line in section.split("\n"):
+        line = line.strip()
+        # Project IDs are 7-char alphanumeric
+        match = re.match(r"^([a-z0-9]{7})\s+(.+)", line)
+        if match:
+            parts = re.split(r"\s{2,}", line)
+            if len(parts) >= 5:
+                projects.append({
+                    "project_id": parts[0].strip(),
+                    "name": parts[1].strip(),
+                    "latest_job_id": parts[4].strip() if len(parts) > 4 else "",
+                })
+
+    return projects
+
+
+
+def parse_gpu_info(instance: str) -> str:
+    """Extract GPU count and type from instance string like 'H200:8x192x2048 - 8 H200 GPUs'."""
+    m = re.search(r"(\d+)\s+(H\d+|A\d+\w*)\s+GPU", instance)
+    if m:
+        return f"{m.group(1)}x{m.group(2)}"
+    return ""
+
+
+def total_gpus(jobs: list[dict]) -> int:
+    """Sum GPU count across all active jobs."""
+    total = 0
+    for job in jobs:
+        m = re.search(r"(\d+)\s+(?:H\d+|A\d+\w*)\s+GPU", job.get("Instance Type", ""))
+        if m:
+            total += int(m.group(1))
+    return total
+
+
+def short_status(status: str) -> str:
+    return (
+        status.replace("TRAINING_JOB_", "")
+        .replace("_", " ")
+        .title()
+    )
+
+
+
+def parse_wandb_run_url(raw: str) -> str:
+    """Extract the first concrete W&B run URL from training logs."""
+    urls = re.findall(r"https://(?:www\.)?wandb\.ai/[^\s<>\"']+", strip_ansi(raw))
+    for url in urls:
+        url = url.rstrip(".,;:)]}")
+        if "/runs/" in url:
+            return url
+    return ""
+
+
+
+def open_wandb_run(job_id: str) -> None:
+    """Resolve a job's W&B URL from its logs and open it in the browser."""
+    if not re.fullmatch(r"[a-z0-9]{7}", job_id):
+        notify(f"Invalid Baseten job ID: {job_id}")
+        return
+
+    try:
+        result = subprocess.run(
+            [
+                "truss",
+                "train",
+                "logs",
+                "--job-id",
+                job_id,
+                "--non-interactive",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=45,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        notify(f"Could not read logs for {job_id}")
+        return
+
+    url = parse_wandb_run_url(result.stdout + result.stderr)
+    if not url:
+        notify(f"No W&B run URL found in logs for {job_id}")
+        return
+
+    subprocess.run(["/usr/bin/open", url], capture_output=True, timeout=5)
+
+
+
+def status_icon(status: str) -> str:
+    """Colored dot for a Baseten job status."""
+    s = status.upper()
+    if "RUNNING" in s:
+        return sf_icon("circle.fill", GREEN)
+    if "CREATED" in s:
+        return sf_icon("circle.fill", ORANGE)
+    if "FAILED" in s:
+        return sf_icon("circle.fill", RED)
+    if "STOPPED" in s or "COMPLETED" in s:
+        return sf_icon("circle.fill", GREY)
+    return sf_icon("circle", GREY)
+
+
+def fetch_baseten() -> dict:
+    """Run truss once. Returns {"jobs", "projects", "error"}."""
+    try:
+        result = subprocess.run(
+            ["truss", "train", "view", "--non-interactive"],
+            capture_output=True, text=True, timeout=TRUSS_TIMEOUT,
+        )
+    except FileNotFoundError:
+        return {"jobs": [], "projects": [], "error": "truss not found in PATH"}
+    except subprocess.TimeoutExpired:
+        return {"jobs": [], "projects": [], "error": f"truss timed out after {TRUSS_TIMEOUT}s"}
+    raw = result.stdout + result.stderr
+    if result.returncode != 0:
+        tail = strip_ansi(result.stderr).strip().splitlines()
+        return {"jobs": [], "projects": [], "error": f"truss exited {result.returncode}: {tail[-1][:160] if tail else ''}"}
+    projects = parse_projects(raw)
+    return {"jobs": parse_active_jobs(raw, projects), "projects": projects, "error": ""}
+
+
+# --------------------------------------------------------------------------
+# This Mac
+# --------------------------------------------------------------------------
+
+LOCAL_POLL_INTERVAL = 2.0
+
+
+def _sysctl(name: str) -> str:
+    try:
+        return subprocess.run(["/usr/sbin/sysctl", "-n", name], capture_output=True, text=True, timeout=3).stdout.strip()
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+
+
+def local_identity() -> dict:
+    """Static facts about this machine (read once)."""
+    try:
+        name = subprocess.run(["/usr/sbin/scutil", "--get", "ComputerName"], capture_output=True, text=True, timeout=3).stdout.strip()
+    except (OSError, subprocess.TimeoutExpired):
+        name = ""
+    chip = _sysctl("machdep.cpu.brand_string")
+    cores = _sysctl("hw.ncpu")
+    mem = _sysctl("hw.memsize")
+    return {
+        "name": name or os.uname().nodename.split(".")[0],
+        "chip": re.sub(r"\s+", " ", chip),
+        "cores": int(cores) if cores.isdigit() else 0,
+        "mem_total_mb": int(mem) // (1024 * 1024) if mem.isdigit() else 0,
+    }
+
+
+_TOP_MEM_RE = re.compile(r"PhysMem:\s*([\d.]+)([KMG]) used.*?([\d.]+)([KMG]) unused")
+_TOP_CPU_RE = re.compile(r"CPU usage:\s*([\d.]+)% user,\s*([\d.]+)% sys,\s*([\d.]+)% idle")
+_TOP_LOAD_RE = re.compile(r"Load Avg:\s*([\d.]+),\s*([\d.]+),\s*([\d.]+)")
+
+
+def _to_mb(value: str, unit: str) -> int:
+    scale = {"K": 1 / 1024, "M": 1, "G": 1024}[unit]
+    return int(float(value) * scale)
+
+
+def fetch_local_metrics(ident: dict) -> dict:
+    """Sample this Mac: real CPU% over ~1s via top, memory, disk, processes."""
+    m: dict = {"gpus": [], "gpu_procs": [], "procs": []}
+    try:
+        top = subprocess.run(
+            ["/usr/bin/top", "-l", "2", "-n", "0", "-s", "1"],
+            capture_output=True, text=True, timeout=8,
+        ).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        top = ""
+    cpu = _TOP_CPU_RE.findall(top)
+    if cpu:
+        user, sys_, _idle = cpu[-1]  # second sample is the real interval
+        m["cpu_pct"] = int(round(float(user) + float(sys_)))
+    load = _TOP_LOAD_RE.findall(top)
+    if load:
+        m["load"] = " ".join(load[-1])
+    m["cores"] = ident.get("cores", 0)
+    mem = _TOP_MEM_RE.findall(top)
+    if mem:
+        used_v, used_u, unused_v, unused_u = mem[-1]
+        used = _to_mb(used_v, used_u)
+        total = ident.get("mem_total_mb") or used + _to_mb(unused_v, unused_u)
+        m["mem_used_mb"], m["mem_total_mb"] = used, total
+    try:
+        # The Data volume is where user files live; "/" is the small sealed system volume.
+        df = subprocess.run(["/bin/df", "-k", "/System/Volumes/Data"], capture_output=True, text=True, timeout=5).stdout.splitlines()
+        if len(df) >= 2:
+            cols = df[1].split()
+            m["disk_used_mb"], m["disk_total_mb"] = int(cols[2]) // 1024, int(cols[1]) // 1024
+    except (OSError, subprocess.TimeoutExpired, ValueError, IndexError):
+        pass
+    try:
+        ps = subprocess.run(
+            ["/bin/ps", "-Ao", "pid,user,%cpu,%mem,etime,args", "-r"],
+            capture_output=True, text=True, timeout=5,
+        ).stdout.splitlines()[1:40]
+        for line in ps:
+            fields = line.split(None, 5)
+            if len(fields) >= 6:
+                m["procs"].append({
+                    "pid": fields[0], "user": fields[1], "cpu": float(fields[2]),
+                    "mem": float(fields[3]), "etime": _etime_seconds(fields[4]), "args": fields[5],
+                })
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        pass
+    return m
 
 
 # --------------------------------------------------------------------------
@@ -952,68 +1337,167 @@ def console_url(box: dict, cfg: dict) -> str:
     )
 
 
-def render(snap: dict) -> str:
-    """Build the full menu text for one frame."""
-    cfg, fetched = snap["cfg"], snap["fetched"]
+def _bt_title(bt: dict) -> tuple[str, str]:
+    """(text, color) for the Baseten part of the menu bar."""
+    if bt["error"]:
+        return "BT: err", "red"
+    jobs = bt["jobs"]
+    running = [j for j in jobs if "RUNNING" in j.get("Status", "").upper()]
+    created = [j for j in jobs if "CREATED" in j.get("Status", "").upper()]
+    active = running or created
+    gpus = total_gpus(active) if active else 0
+    gpu_str = f" ({gpus} GPUs)" if gpus else ""
+    if running:
+        return f"BT: {len(running)} running{gpu_str}", "green"
+    if created:
+        return f"BT: {len(created)} starting{gpu_str}", "orange"
+    if jobs:
+        return f"BT: {len(jobs)} jobs", ""
+    if not bt["at"]:
+        return "BT: …", ""
+    return "BT: idle", ""
+
+
+def _local_title(ident: dict, m: dict | None) -> str:
+    text = _truncate(ident.get("name") or "Mac", 14)
+    if m:
+        bits = []
+        if m.get("cpu_pct") is not None:
+            bits.append(f"CPU {m['cpu_pct']}%")
+        mem = _pct(m.get("mem_used_mb"), m.get("mem_total_mb"))
+        if mem is not None:
+            bits.append(f"RAM {mem:.0f}%")
+        if bits:
+            text += SEP + SEP.join(bits)
+    return text
+
+
+def _ec2_title(cfg: dict, fetched: dict, snap: dict, now: float) -> tuple[str, str]:
+    if not cfg["configured"]:
+        return ("EC2: config err", "red") if cfg["error"] else ("", "")
+    if fetched["auth_error"]:
+        return "EC2: sign in", "orange"
+    if fetched["error"]:
+        return "EC2: err", "red"
+    boxes = fetched["boxes"]
+    running = [b for b in boxes if b.get("state") == "running"]
+    cpus, rams, vrams = [], [], []
+    for b in running:
+        entry = snap["metrics"].get(b["id"])
+        if entry and now - entry["at"] <= STALE_AFTER:
+            m = entry["m"]
+            if m.get("cpu_pct") is not None:
+                cpus.append(m["cpu_pct"])
+            ram = _pct(m.get("mem_used_mb"), m.get("mem_total_mb"))
+            if ram is not None:
+                rams.append(ram)
+            vram = _vram_pct(m)
+            if vram is not None:
+                vrams.append(vram)
+    text = f"EC2: {len(running)}/{len(boxes)} up"
+    if cpus:
+        text += f"{SEP}CPU {max(cpus)}%"
+    if rams:
+        text += f"{SEP}RAM {max(rams):.0f}%"
+    if vrams:
+        text += f"{SEP}VRAM {max(vrams):.0f}%"
+    if any(b.get("impaired") for b in running):
+        return text + " ⚠", "red"
+    return text, ""
+
+
+def render_title(snap: dict, now: float) -> str:
+    cfg, fetched, bt = snap["cfg"], snap["fetched"], snap["bt"]
+    pinned_key = cfg.get("pinned", "")
+
+    if pinned_key == "baseten":
+        text, color = _bt_title(bt)
+        return f"{text} | color={color}" if color else text
+    if pinned_key == "local":
+        fresh = snap["local"] if snap["local"] and now - snap["local_at"] <= STALE_AFTER else None
+        return _local_title(snap["local_ident"], fresh)
+    pinned = next(
+        (b for b in fetched["boxes"] if pinned_key and pinned_key in (b["id"], b.get("name")) and not b.get("missing")),
+        None,
+    )
+    if pinned:
+        entry = snap["metrics"].get(pinned["id"])
+        fresh = entry["m"] if entry and now - entry["at"] <= STALE_AFTER else None
+        if pinned.get("state") != "running":
+            return f"{title_preview(pinned, None)}: {pinned.get('state', 'unknown')} | color=gray"
+        text = title_preview(pinned, fresh)
+        return f"{text} | color=red" if pinned.get("impaired") else text
+
+    # Nothing pinned: compact summary of all three.
+    bt_text, bt_color = _bt_title(bt)
+    ec2_text, ec2_color = _ec2_title(cfg, fetched, snap, now)
+    ec2_short = ec2_text.split(SEP)[0] if ec2_text else ""   # just "EC2: 2/2 up"
+    local = snap["local"] if snap["local"] and now - snap["local_at"] <= STALE_AFTER else None
+    local_short = f"Mac: CPU {local['cpu_pct']}%" if local and local.get("cpu_pct") is not None else ""
+    text = SEP.join(t for t in (bt_text, ec2_short, local_short) if t)
+    color = bt_color or ec2_color
+    return f"{text} | color={color}" if color else text
+
+
+def render_baseten(snap: dict, me: str) -> list[str]:
+    bt = snap["bt"]
     python = shlex.quote(sys.executable)
     script = shlex.quote(os.path.abspath(__file__))
-    me = f"bash={python} param1={script}"
-    now = time.time()
-    lines: list[str] = []
+    pinned = snap["cfg"].get("pinned") == "baseten"
+    head_text, _ = _bt_title(bt)
+    head_click = f"{me} param2={'--aws-unpin' if pinned else '--aws-pin param3=baseten'} terminal=false"
+    lines = [f"Baseten — {head_text[4:]} | {head_click}{' checked=true' if pinned else ''}"]
 
-    # ---- title (plain text, like the Baseten plugin's "BT: ...") ----------
-    if not cfg["configured"]:
-        lines.append("EC2: config err | color=red" if cfg["error"] else "EC2: setup")
-    elif fetched["auth_error"]:
-        lines.append("EC2: sign in | color=orange")
-    elif fetched["error"]:
-        lines.append("EC2: err | color=red")
-    else:
-        boxes = fetched["boxes"]
-        running = [b for b in boxes if b.get("state") == "running"]
-        pinned = next(
-            (b for b in boxes if cfg.get("pinned") and cfg["pinned"] in (b["id"], b.get("name"))
-             and not b.get("missing")),
-            None,
+    if bt["error"]:
+        lines.append(f"--⚠️ {bt['error']} | color=red size=12")
+        return lines
+    if not bt["at"]:
+        lines.append("--Loading… | color=gray size=12")
+        return lines
+
+    jobs = bt["jobs"]
+    if not jobs:
+        lines.append("--No active training jobs | size=12")
+    for job in jobs:
+        job_id = job.get("job_id", "?")
+        job_name = job.get("Job Name", job_id)
+        status = job.get("Status", "UNKNOWN")
+        project_id = job.get("Project ID", "")
+        instance = job.get("Instance Type", "")
+        created_by = job.get("Created By", "")
+        created_at = job.get("Created", "")
+        elapsed = elapsed_time(created_at)
+        url = f"https://app.baseten.co/training/{project_id}/logs/{job_id}"
+        gpu = parse_gpu_info(instance)
+        gpu_label = f" [{gpu}]" if gpu else ""
+        elapsed_label = f" · {elapsed}" if elapsed else ""
+        lines.append(f"--{job_name} — {short_status(status)}{elapsed_label}{gpu_label} | {status_icon(status)} href={url}")
+        lines.append(f"----Job ID: {job_id} | font=monospace size=12")
+        lines.append(f"----Instance: {instance} | size=12")
+        if created_by:
+            lines.append(f"----Launched by: {created_by} | size=12")
+        if elapsed:
+            duration_name = "Running for" if "RUNNING" in status.upper() else "Elapsed"
+            lines.append(f"----{duration_name}: {elapsed} | size=12")
+        lines.append(f"----Created: {created_at} | size=12")
+        lines.append(f"----Open Baseten Logs | href={url}")
+        lines.append(
+            f"----Open W&B Run | bash={python} param1={script} "
+            f"param2=--open-wandb param3={job_id} terminal=false refresh=false"
         )
-        if pinned:
-            # One box in the menu bar: SKU, short name, CPU · RAM · VRAM.
-            entry = snap["metrics"].get(pinned["id"])
-            fresh = entry["m"] if entry and now - entry["at"] <= STALE_AFTER else None
-            if pinned.get("state") != "running":
-                lines.append(f"{title_preview(pinned, None)}: {pinned.get('state', 'unknown')} | color=gray")
-            else:
-                text = title_preview(pinned, fresh)
-                lines.append(f"{text} | color=red" if pinned.get("impaired") else text)
-        else:
-            cpus, rams, vrams = [], [], []
-            for b in running:
-                entry = snap["metrics"].get(b["id"])
-                if entry and now - entry["at"] <= STALE_AFTER:
-                    m = entry["m"]
-                    if m.get("cpu_pct") is not None:
-                        cpus.append(m["cpu_pct"])
-                    ram = _pct(m.get("mem_used_mb"), m.get("mem_total_mb"))
-                    if ram is not None:
-                        rams.append(ram)
-                    vram = _vram_pct(m)
-                    if vram is not None:
-                        vrams.append(vram)
-            text = f"EC2: {len(running)}/{len(boxes)} up"
-            if cpus:
-                text += f"{SEP}CPU {max(cpus)}%"
-            if rams:
-                text += f"{SEP}RAM {max(rams):.0f}%"
-            if vrams:
-                text += f"{SEP}VRAM {max(vrams):.0f}%"
-            if any(b.get("impaired") for b in running):
-                lines.append(f"{text} ⚠ | color=red")
-            else:
-                lines.append(text)
+        lines.append(f"----Copy Job ID | bash=/bin/bash param1=-c param2='echo -n {job_id} | pbcopy' terminal=false")
 
-    lines.append("---")
+    if bt["projects"]:
+        lines.append("-------")
+        lines.append("--All Projects")
+        for pr in bt["projects"]:
+            lines.append(f"----{pr['name']} ({pr['project_id']}) | href=https://app.baseten.co/training/{pr['project_id']}")
+    return lines
 
-    # ---- body ------------------------------------------------------------
+
+def render_aws(snap: dict, me: str, now: float) -> list[str]:
+    cfg, fetched = snap["cfg"], snap["fetched"]
+    lines: list[str] = []
     scope = " · ".join(x for x in (cfg.get("profile"), cfg.get("region")) if x)
     lines.append("AWS Dev Boxes" + (f" ({scope})" if scope else ""))
 
@@ -1028,7 +1512,7 @@ def render(snap: dict) -> str:
         else:
             lines.append("--Not configured | size=12")
         lines.append(f"--Set up AWS dev boxes… | {me} param2=--aws-setup terminal=false refresh=true")
-        return "\n".join(lines)
+        return lines
 
     for w in cfg["warnings"]:
         lines.append(f"--⚠️ {w} | color=orange size=12")
@@ -1058,7 +1542,6 @@ def render(snap: dict) -> str:
         has_public = bool(host)
         is_pinned = bool(cfg.get("pinned")) and cfg["pinned"] in (box["id"], name)
         # Clicking a box pins it to the menu bar (or unpins the pinned one).
-        # SSH / SSM / console are options in its submenu.
         click = f"{me} param2={'--aws-unpin' if is_pinned else '--aws-pin param3=' + box['id']} terminal=false"
 
         entry = snap["metrics"].get(box["id"])
@@ -1113,11 +1596,48 @@ def render(snap: dict) -> str:
             lines.append(f"--▶ Start instance | {me} param2=--aws-start param3={box['id']} terminal=false")
         elif state == "running":
             lines.append(f"--■ Stop instance… | {me} param2=--aws-stop param3={box['id']} terminal=false")
+    return lines
+
+
+def render_local(snap: dict, me: str, now: float) -> list[str]:
+    ident, m = snap["local_ident"], snap["local"]
+    pinned = snap["cfg"].get("pinned") == "local"
+    click = f"{me} param2={'--aws-unpin' if pinned else '--aws-pin param3=local'} terminal=false"
+    chip = f" [{ident['chip']}]" if ident.get("chip") else ""
+    summary = f" · {metrics_summary(m)}" if m else ""
+    lines = [f"{ident['name']} — this Mac{chip}{summary} | {sf_icon('circle.fill', GREEN)} {click}{' checked=true' if pinned else ''}"]
+    if m:
+        lines.extend(metrics_lines(m, now - snap["local_at"]))
+        lines.extend(process_lines(m))
+    else:
+        lines.append("--Sampling… | color=gray size=11")
+    lines.append("-----")
+    if pinned:
+        lines.append(f"--Unpin from menu bar | {me} param2=--aws-unpin terminal=false")
+    else:
+        lines.append(f"--Pin to menu bar | {me} param2=--aws-pin param3=local terminal=false")
+    lines.append("--Open Activity Monitor | bash=/usr/bin/open param1=-a param2=Activity\\ Monitor terminal=false")
+    return lines
+
+
+def render(snap: dict) -> str:
+    """Build the full menu text for one frame."""
+    python = shlex.quote(sys.executable)
+    script = shlex.quote(os.path.abspath(__file__))
+    me = f"bash={python} param1={script}"
+    now = time.time()
+
+    lines: list[str] = [render_title(snap, now), "---"]
+    lines += render_baseten(snap, me)
+    lines.append("---")
+    lines += render_aws(snap, me, now)
+    lines.append("---")
+    lines += render_local(snap, me, now)
 
     lines.append("---")
-    age = now - snap["last_poll"] if snap["last_poll"] else None
-    polled = f"EC2 state polled {age:.0f}s ago · usage every {METRICS_PERIOD:.0f}s" if age is not None else "Polling EC2…"
-    lines.append(f"{polled} | size=11 color=gray")
+    bt_age = f"Baseten {now - snap['bt']['at']:.0f}s ago" if snap["bt"]["at"] else "Baseten loading"
+    ec2_age = f"EC2 {now - snap['last_poll']:.0f}s ago" if snap["last_poll"] else "EC2 loading"
+    lines.append(f"Polled: {bt_age} · {ec2_age} · usage every {METRICS_PERIOD:.0f}s | size=11 color=gray")
     lines.append(f"Edit AWS dev box settings… | {me} param2=--aws-setup terminal=false refresh=true")
     lines.append("Refresh | refresh=true")
     return "\n".join(lines)
@@ -1135,9 +1655,30 @@ def stream_forever() -> None:
                     state.fetched = {"boxes": [], "error": f"poll failed: {exc}"[:200], "auth_error": False}
             time.sleep(EC2_POLL_INTERVAL)
 
-    threading.Thread(target=poller, daemon=True, name="ec2-poller").start()
+    def bt_poller():
+        while True:
+            try:
+                state.poll_baseten()
+            except Exception as exc:
+                with state.lock:
+                    state.bt = {"jobs": [], "projects": [], "error": f"poll failed: {exc}"[:200], "at": time.time()}
+            time.sleep(TRUSS_POLL_INTERVAL)
 
-    # First frame right away so the menu bar is not blank while EC2 loads.
+    def local_poller():
+        while True:
+            started = time.time()
+            try:
+                state.poll_local()
+            except Exception:
+                pass
+            # `top` itself takes ~1s, so sleep only the remainder of the period.
+            time.sleep(max(0.2, LOCAL_POLL_INTERVAL - (time.time() - started)))
+
+    threading.Thread(target=poller, daemon=True, name="ec2-poller").start()
+    threading.Thread(target=bt_poller, daemon=True, name="truss-poller").start()
+    threading.Thread(target=local_poller, daemon=True, name="local-poller").start()
+
+    # First frame right away so the menu bar is not blank while things load.
     while True:
         try:
             sys.stdout.write("~~~\n")
@@ -1201,7 +1742,7 @@ def run_interactive(cmd: list[str], title: str) -> None:
     open_in_terminal(cmd, title)
 
 
-def notify(message: str, title: str = "AWS Dev Boxes") -> None:
+def notify(message: str, title: str = "Baseten Monitor") -> None:
     message = message.replace('"', '\\"')
     title = title.replace('"', '\\"')
     subprocess.run(
@@ -1246,7 +1787,7 @@ def action(name: str, instance_id: str, host: str = "") -> None:
         return
 
     if name in ("--aws-pin", "--aws-unpin"):
-        if name == "--aws-pin" and not INSTANCE_ID_RE.fullmatch(instance_id):
+        if name == "--aws-pin" and instance_id not in SPECIAL_PINS and not INSTANCE_ID_RE.fullmatch(instance_id):
             notify(f"Invalid instance ID: {instance_id[:40]}")
             return
         err = write_config_key("BTMON_PINNED", instance_id if name == "--aws-pin" else "")
@@ -1254,7 +1795,7 @@ def action(name: str, instance_id: str, host: str = "") -> None:
             notify(err)
             return
         # Restart the stream so the menu bar switches right away.
-        subprocess.run(["/usr/bin/open", "-g", "swiftbar://refreshplugin?name=devboxes"], capture_output=True)
+        subprocess.run(["/usr/bin/open", "-g", "swiftbar://refreshplugin?name=monitor"], capture_output=True)
         return
 
     if not INSTANCE_ID_RE.fullmatch(instance_id):
@@ -1416,7 +1957,7 @@ def setup() -> None:
         fh.write("\n".join(lines) + "\n")
     os.chmod(CONFIG_PATH, 0o600)
     print(f"\nWrote {CONFIG_PATH}")
-    subprocess.run(["/usr/bin/open", "-g", "swiftbar://refreshplugin?name=devboxes"], capture_output=True)
+    subprocess.run(["/usr/bin/open", "-g", "swiftbar://refreshplugin?name=monitor"], capture_output=True)
 
 
 INSTANCE_ACTIONS = {"--aws-start", "--aws-stop", "--aws-ssm", "--aws-ssh", "--aws-htop", "--aws-pin"}
@@ -1425,6 +1966,8 @@ if __name__ == "__main__":
     args = sys.argv[1:]
     if len(args) in (2, 3) and args[0] in INSTANCE_ACTIONS:
         action(args[0], args[1], args[2] if len(args) == 3 else "")
+    elif len(args) == 2 and args[0] == "--open-wandb":
+        open_wandb_run(args[1])
     elif args in (["--aws-login"], ["--aws-unpin"]):
         action(args[0], "")
     elif args == ["--aws-setup"]:
@@ -1435,6 +1978,8 @@ if __name__ == "__main__":
     elif args == ["--once"]:
         # Debug helper: one EC2 poll, a few seconds of metrics, one frame.
         st = State()
+        threading.Thread(target=st.poll_baseten, daemon=True).start()
+        threading.Thread(target=st.poll_local, daemon=True).start()
         st.poll_ec2()
         time.sleep(float(os.environ.get("BTMON_ONCE_WAIT", "5")))
         print(render(st.snapshot()))

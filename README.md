@@ -1,9 +1,14 @@
 # Baseten Job Monitor
 
-Two macOS menu bar plugins for [SwiftBar](https://github.com/swiftbar/SwiftBar):
+One macOS menu bar item for [SwiftBar](https://github.com/swiftbar/SwiftBar) that shows three things in a single dropdown:
 
-- `baseten.1m.py` monitors your [Baseten](https://www.baseten.co/) training jobs, refreshing every minute.
-- `devboxes.py` (optional) is a live monitor for your AWS EC2 dev boxes. It stays running, polls EC2 state once a minute, and streams CPU, RAM, disk, and GPU usage from each box every 2 seconds, like a tiny `htop` in your menu bar.
+- **Baseten** — your [Baseten](https://www.baseten.co/) training jobs, polled every minute.
+- **AWS Dev Boxes** — your EC2 dev boxes, with live CPU, RAM, disk, and GPU usage and a table of what is running on each one, streamed every 2 seconds like a tiny `htop`.
+- **This Mac** — the same usage bars and process table for the machine you are sitting at.
+
+The plugin is `monitor.py`. Click any section header (a box, the Mac, or the Baseten line) to pin it to the menu bar; click it again to unpin and go back to the combined summary.
+
+`baseten.1m.py` is the original Baseten-only plugin. Install it instead of `monitor.py` if you only want job status and nothing else.
 
 ## Features
 
@@ -18,10 +23,15 @@ Two macOS menu bar plugins for [SwiftBar](https://github.com/swiftbar/SwiftBar):
 - Copy job IDs to clipboard
 - Browse all training projects
 
-### AWS dev boxes (optional, `devboxes.py`)
+### Menu bar title
 
-- Its own menu bar item with a live summary, e.g. `EC2: 2/2 up  ·  CPU 21%  ·  RAM 43%  ·  VRAM 6%`
-- **Pin to menu bar** in any box's dropdown puts that one box in the menu bar instead: instance type, short name, and live CPU, RAM, and VRAM, e.g. `g6.4xlarge  ·  Ishaan-exte…  ·  CPU 21%  ·  RAM 35%  ·  VRAM 6%`. The pinned box shows a checkmark in the list; **Unpin from menu bar** goes back to the summary.
+- With nothing pinned the title is a compact summary of all three, e.g. `BT: 12 running (12 GPUs)  ·  EC2: 2/2 up  ·  Mac: CPU 17%`.
+- Pin a dev box and the title becomes its instance type, short name, and live CPU, RAM, and VRAM, e.g. `g6.4xlarge  ·  Ishaan-exte…  ·  CPU 21%  ·  RAM 35%  ·  VRAM 6%`.
+- Pin the Mac to see `Ishaan’s MacBoo…  ·  CPU 17%  ·  RAM 68%`, or pin Baseten to see just `BT: 12 running (12 GPUs)`.
+- The pinned item shows a checkmark in the dropdown. **Pin to menu bar** / **Unpin from menu bar** are also in each item's submenu.
+
+### AWS dev boxes (optional)
+
 - Per-box state dot (green running, orange pending, grey stopped, red impaired), instance type, uptime, public and private IP.
 - Live usage inside each box's menu, updated every 2 seconds: CPU % with core count and load average, RAM, swap (when in use), disk on `/`, and on GPU boxes each GPU's utilization, VRAM, and temperature from `nvidia-smi`. A compact `CPU 32% · RAM 41% · GPU 87%` summary sits on the box's main line. Rows turn orange above 70% and red above 90%.
 - A process table under the usage bars shows what is actually running on the box, grouped by project and command rather than by process, e.g. `822% cpu 6.5% mem 18m  10× [ocr-bench-scoring] python -m ocr_bench.cli rescore --datasets …`. The project label comes from the virtualenv or repo directory in the command path. Identical workers collapse into one row with a count, long paths are shortened, and processes running as another user are marked. GPU boxes also list which process holds how much VRAM.
@@ -30,12 +40,18 @@ Two macOS menu bar plugins for [SwiftBar](https://github.com/swiftbar/SwiftBar):
 - Submenu actions: open `htop` in Terminal, open in the AWS console, connect via SSM or SSH, copy the IP or instance ID, start a stopped box, or stop a running one (with a confirmation dialog)
 - A "Sign in" action appears in the menu when your AWS session has expired
 
+### This Mac
+
+- Computer name and chip, with CPU (from `top`, a real one-second sample), RAM, and disk on the data volume, in the same bar style as the dev boxes.
+- The same grouped process table, so you can see what Cursor, your training scripts, or anything else is doing locally.
+- **Open Activity Monitor** in the submenu.
+
 ## Prerequisites
 
 - macOS
 - Python 3.9+ (the macOS system Python works)
 - [SwiftBar](https://github.com/swiftbar/SwiftBar)
-- [Truss CLI](https://docs.baseten.co/truss/overview) installed and authenticated
+- For the Baseten section: [Truss CLI](https://docs.baseten.co/truss/overview) installed and authenticated. Without it the section just shows an error; the rest keeps working.
 - For AWS dev boxes: [AWS CLI v2](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html) installed and signed in (`aws login` or `aws sso login`)
 
 ## Installation
@@ -61,27 +77,26 @@ Make sure `truss` is on your PATH:
 which truss
 ```
 
-### 3. Add the plugins
+### 3. Add the plugin
 
-Clone this repo and symlink (or copy) the plugins into your SwiftBar plugins directory. Skip `devboxes.py` if you do not want the AWS monitor.
+Clone this repo and symlink (or copy) `monitor.py` into your SwiftBar plugins directory. (Use `baseten.1m.py` instead if you only want Baseten job status.)
 
 ```bash
 git clone https://github.com/ameya005/baseten-job-monitor.git
-ln -s "$(pwd)/baseten-job-monitor/baseten.1m.py" ~/swiftbar-plugins/baseten.1m.py
-ln -s "$(pwd)/baseten-job-monitor/devboxes.py" ~/swiftbar-plugins/devboxes.py
+ln -s "$(pwd)/baseten-job-monitor/monitor.py" ~/swiftbar-plugins/monitor.py
 chmod +x ~/swiftbar-plugins/*.py
 ```
 
 ### 4. Refresh SwiftBar
 
-Click the SwiftBar icon in the menu bar and select **Refresh All**, or restart SwiftBar. You should see **BT: idle** (or your active jobs) appear in the menu bar, and if you added `devboxes.py`, a server icon labelled **EC2**.
+Click the SwiftBar icon in the menu bar and select **Refresh All**, or restart SwiftBar. You should see something like **BT: idle  ·  Mac: CPU 12%** in the menu bar (the AWS part appears once you set it up).
 
 ### 5. (Optional) Add your AWS dev boxes
 
-Click the **EC2** menu bar item, then **Set up AWS dev boxes…**. A Terminal window opens, lists the EC2 instances your AWS sign-in can see, and asks you to pick yours. Or run it by hand:
+Open the dropdown, then under **AWS Dev Boxes** click **Set up AWS dev boxes…**. A Terminal window opens, lists the EC2 instances your AWS sign-in can see, and asks you to pick yours. Or run it by hand:
 
 ```bash
-python3 ~/swiftbar-plugins/devboxes.py --aws-setup
+python3 ~/swiftbar-plugins/monitor.py --aws-setup
 ```
 
 That writes `~/.config/baseten-job-monitor/aws.env` (mode `0600`) that looks like this:
@@ -93,7 +108,7 @@ AWS_REGION=us-east-2          # optional; defaults to the profile's region
 BTMON_DEV_BOXES=i-0123456789abcdef0,my-box-name   # instance IDs or Name tags
 BTMON_SSH_USER=ubuntu         # optional; blank means rely on ~/.ssh/config
 BTMON_SSH_KEY=~/.ssh/my-key.pem   # optional; passed to `ssh -i`, must be mode 0600
-BTMON_PINNED=i-0123456789abcdef0  # optional; set by "Pin to menu bar" in the dropdown
+BTMON_PINNED=i-0123456789abcdef0  # optional; set by "Pin to menu bar". Also accepts "local" (this Mac) or "baseten"
 ```
 
 Any of those keys can also be set as environment variables, which take priority over the file.
@@ -117,15 +132,15 @@ The plugin only needs read access to EC2 (`ec2:DescribeInstances`, `ec2:Describe
 
 ### Refresh interval
 
-For the Baseten plugin, the filename controls the refresh interval — `1m` means every 1 minute. Rename the file to change it:
+`monitor.py` is a SwiftBar "streamable" plugin, so it has no interval in its name. Its timings are constants in the file: `TRUSS_POLL_INTERVAL` (60 s), `EC2_POLL_INTERVAL` (60 s), `METRICS_PERIOD` and `LOCAL_POLL_INTERVAL` (2 s), and `RENDER_INTERVAL` (2 s).
+
+For the Baseten-only plugin, the filename controls the refresh interval — `1m` means every 1 minute. Rename the file to change it:
 
 | Filename | Interval |
 |---|---|
 | `baseten.30s.py` | 30 seconds |
 | `baseten.1m.py` | 1 minute (default) |
 | `baseten.5m.py` | 5 minutes |
-
-The dev box plugin is a SwiftBar "streamable" plugin, so it has no interval in its name. Its timings are constants near the top of `devboxes.py`: `EC2_POLL_INTERVAL` (60 s), `METRICS_PERIOD` (2 s), and `RENDER_INTERVAL` (2 s).
 
 ### PATH resolution
 
