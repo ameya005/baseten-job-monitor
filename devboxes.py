@@ -387,10 +387,22 @@ while :; do
   if command -v nvidia-smi >/dev/null 2>&1; then
     nvidia-smi --query-gpu=index,name,utilization.gpu,memory.used,memory.total,temperature.gpu \
       --format=csv,noheader,nounits 2>/dev/null | sed 's/^/GPU /'
+    nvidia-smi --query-compute-apps=pid,process_name,used_memory \
+      --format=csv,noheader,nounits 2>/dev/null | sed 's/^/GPUP /'
   fi
+  ps -eo pid,user:12,pcpu,pmem,etime,args --sort=-pcpu --no-headers 2>/dev/null | head -40 | sed 's/^/PS /'
   echo "@@END"
 done
 """ % {"sleep": f"{METRICS_PERIOD:.1f}"}
+
+# Processes that are noise in a "what code is running" view.
+PROC_IGNORE_RE = re.compile(
+    r"^(\[.*\]|sshd|sh|bash|zsh|ps|sleep|head|awk|sed|cut|free|df|nvidia-smi|sudo|su|"
+    r"systemd.*|dbus.*|cron|rsyslogd|snapd|unattended-upgrade|packagekitd|polkitd|"
+    r"containerd|containerd-shim.*|dockerd|runc|chrome.*|chromium.*|node_exporter|"
+    r"ssm-agent-worker|amazon-ssm-agent|multipathd|udisksd|networkd-dispatcher|tmux.*|screen|"
+    r"login|getty|agetty|init|kthreadd)$"
+)
 
 
 def ssh_base_cmd(cfg: dict, host: str, batch: bool = True) -> list[str]:
@@ -411,8 +423,152 @@ def ssh_base_cmd(cfg: dict, host: str, batch: bool = True) -> list[str]:
     return cmd
 
 
+def _etime_seconds(etime: str) -> int:
+    """ps etime: [[dd-]hh:]mm:ss -> seconds."""
+    days = 0
+    if "-" in etime:
+        d, etime = etime.split("-", 1)
+        days = int(d)
+    parts = [int(p) for p in etime.split(":")]
+    while len(parts) < 3:
+        parts.insert(0, 0)
+    h, mi, s = parts[-3:]
+    return days * 86400 + h * 3600 + mi * 60 + s
+
+
+def _fmt_secs(secs: int) -> str:
+    if secs >= 86400:
+        return f"{secs // 86400}d{(secs % 86400) // 3600}h"
+    if secs >= 3600:
+        return f"{secs // 3600}h{(secs % 3600) // 60:02d}m"
+    if secs >= 60:
+        return f"{secs // 60}m"
+    return f"{secs}s"
+
+
+def _project_label(path: str) -> str:
+    """'/home/u/Repos/ocr-bench/.venv/bin/python' -> 'ocr-bench'."""
+    m = re.search(r"/([^/]+)/(?:\.venv|venv|\.env|env|node_modules)/", path)
+    if m:
+        return m.group(1)
+    m = re.search(r"/(?:Repos|repos|src|work|bench|projects|code)/([^/]+)/", path)
+    return m.group(1) if m else ""
+
+
+# Interpreter flags that take a value, so we skip the value too.
+_INTERP_VALUE_FLAGS = {"-r", "--require", "--loader", "--import", "-X", "-W", "--env-file", "-cp", "-classpath"}
+# Argument flags whose value is noise in a short label.
+_NOISE_VALUE_FLAGS = {"--env-file", "--log-file", "--config", "--cfg"}
+
+
+def _shorten_path(tok: str) -> str:
+    """'/home/u/bench/stacks/x.env' -> '…/stacks/x.env'; keeps key=value shape."""
+    key, eq, val = tok.partition("=")
+    target = val if eq else tok
+    if target.startswith(("/", "~/")) and target.count("/") >= 3:
+        parts = target.rstrip("/").split("/")
+        target = "…/" + "/".join(parts[-2:])
+    return f"{key}={target}" if eq else target
+
+
+def describe_command(args: str) -> tuple[str, str, str]:
+    """Return (project_label, head, short_command) for a ps args string.
+
+    head is the program identity (script / module / binary) used for
+    grouping; short_command adds a few args for display.
+    """
+    toks = args.split()
+    if not toks:
+        return "", "", ""
+    exe = toks[0]
+    base = os.path.basename(exe)
+    project = _project_label(exe)
+    rest = toks[1:]
+
+    if re.fullmatch(r"(python[\d.]*|node|ruby|perl|java|uv|uvicorn|gunicorn|deno|bun)", base):
+        i = 0
+        while i < len(rest) and rest[i].startswith("-") and rest[i] != "-m":
+            i += 2 if rest[i] in _INTERP_VALUE_FLAGS else 1
+        if i < len(rest) and rest[i] == "-m" and i + 1 < len(rest):
+            head, tail = f"{base} -m {rest[i + 1]}", rest[i + 2:]
+        elif i < len(rest):
+            script = rest[i]
+            project = project or _project_label(script)
+            head, tail = (os.path.basename(script) if "/" in script else script), rest[i + 1:]
+        else:
+            head, tail = base, []
+    else:
+        head, tail = base, rest
+
+    # Drop noisy flag/value pairs, shorten paths, keep a few args so distinct
+    # runs of the same script stay distinguishable.
+    cleaned: list[str] = []
+    skip = False
+    for t in tail:
+        if skip:
+            skip = False
+            continue
+        if t in _NOISE_VALUE_FLAGS:
+            skip = True
+            continue
+        if any(t.startswith(f + "=") for f in _NOISE_VALUE_FLAGS):
+            continue
+        cleaned.append(_shorten_path(t))
+    short = " ".join([head, *cleaned[:4]])
+    return project, head, short[:110]
+
+
+def summarize_procs(procs: list[dict], limit: int = 7) -> list[dict]:
+    """Group processes by (project, command) and sum CPU/MEM.
+
+    Many near-identical workers (same script, different shard args) collapse
+    into one row so the list reads as "what code", not "what pids".
+    """
+    rows = []
+    for p in procs:
+        first = p["args"].split()[0] if p["args"].split() else ""
+        if not first or PROC_IGNORE_RE.match(os.path.basename(first)) or PROC_IGNORE_RE.match(first):
+            continue
+        if p["cpu"] < 0.5 and p["mem"] < 0.5:
+            continue
+        project, head, short = describe_command(p["args"])
+        if short:
+            rows.append((p, project, head, short))
+
+    def build(key_fn):
+        groups: dict = {}
+        for p, project, head, short in rows:
+            key = key_fn(project, head, short)
+            g = groups.setdefault(key, {
+                "project": project, "head": head, "cmd": short, "count": 0,
+                "cpu": 0.0, "mem": 0.0, "etime": 0, "user": p["user"], "pids": [],
+            })
+            g["count"] += 1
+            g["cpu"] += p["cpu"]
+            g["mem"] += p["mem"]
+            g["etime"] = max(g["etime"], p["etime"])
+            g["pids"].append(p["pid"])
+            if g["cmd"] != short:
+                g["cmd"] = head + " …"  # mixed args: show just the program
+        return groups
+
+    fine = build(lambda project, head, short: (project, short))
+    # Collapse (project, head) families with 3+ distinct arg variants.
+    by_head: dict = {}
+    for (project, _short), g in fine.items():
+        by_head.setdefault((project, g["head"]), []).append(g)
+    merged = []
+    for (project, head), gs in by_head.items():
+        if len(gs) >= 3:
+            coarse = build(lambda p_, h_, s_: (p_, h_))
+            merged.append(coarse[(project, head)])
+        else:
+            merged.extend(gs)
+    return sorted(merged, key=lambda g: (-g["cpu"], -g["mem"]))[:limit]
+
+
 def parse_metrics(lines: list[str]) -> dict:
-    m: dict = {"gpus": []}
+    m: dict = {"gpus": [], "gpu_procs": [], "procs": []}
     for line in lines:
         parts = line.split()
         if not parts:
@@ -439,6 +595,26 @@ def parse_metrics(lines: list[str]) -> dict:
                         "vram_used_mb": int(cells[3]) if cells[3].isdigit() else None,
                         "vram_total_mb": int(cells[4]) if cells[4].isdigit() else None,
                         "temp_c": int(cells[5]) if len(cells) > 5 and cells[5].isdigit() else None,
+                    })
+            elif kind == "GPUP":
+                cells = [c.strip() for c in line[5:].split(",")]
+                if len(cells) >= 3:
+                    m["gpu_procs"].append({
+                        "pid": cells[0],
+                        "name": cells[1],
+                        "vram_mb": int(cells[2]) if cells[2].isdigit() else None,
+                    })
+            elif kind == "PS":
+                # PS pid user pcpu pmem etime args...
+                fields = line[3:].split(None, 5)
+                if len(fields) >= 6:
+                    m["procs"].append({
+                        "pid": fields[0],
+                        "user": fields[1],
+                        "cpu": float(fields[2]),
+                        "mem": float(fields[3]),
+                        "etime": _etime_seconds(fields[4]),
+                        "args": fields[5],
                     })
         except ValueError:
             continue
@@ -709,6 +885,40 @@ def metrics_lines(m: dict, age: float) -> list[str]:
     return out
 
 
+def process_lines(m: dict) -> list[str]:
+    """'Running code' section: grouped processes and GPU holders."""
+    mono = "font=Menlo size=11"
+    out: list[str] = []
+    groups = summarize_procs(m.get("procs", []))
+    gpu_procs = m.get("gpu_procs", [])
+    if not groups and not gpu_procs:
+        return out
+
+    out.append("-----")
+    out.append("--Running code | size=11 color=gray")
+    for g in groups:
+        count = f"{g['count']}× " if g["count"] > 1 else ""
+        project = f"[{g['project']}] " if g["project"] else ""
+        user = f" ({g['user']})" if g["user"] not in ("ubuntu", "ec2-user", "") else ""
+        label = f"{count}{project}{g['cmd']}{user}"
+        stats = f"{g['cpu']:>4.0f}% cpu {g['mem']:>4.1f}% mem {_fmt_secs(g['etime']):>6}"
+        out.append(f"--{stats}  {label} | {mono} length=120 {sf_icon('chevron.right', GREY, 'small')}")
+
+    if gpu_procs:
+        # Attribute GPU memory to the process' project when we can.
+        by_pid = {p["pid"]: p for p in m.get("procs", [])}
+        for gp in gpu_procs:
+            proc = by_pid.get(gp["pid"])
+            if proc:
+                project, _head, short = describe_command(proc["args"])
+            else:
+                project, short = _project_label(gp["name"]), os.path.basename(gp["name"])
+            label = (f"[{project}] " if project else "") + (short or gp["name"])
+            vram = f"{gp['vram_mb']} MiB" if gp.get("vram_mb") is not None else "?"
+            out.append(f"--GPU {vram:>9}  pid {gp['pid']}  {label} | {mono} length=120 {sf_icon('rectangle.3.group', BLUE, 'small')}")
+    return out
+
+
 def console_url(box: dict, cfg: dict) -> str:
     region = box.get("region") or cfg.get("region") or "us-east-1"
     return (
@@ -840,6 +1050,7 @@ def render(snap: dict) -> str:
 
         if m:
             lines.extend(metrics_lines(m, age))
+            lines.extend(process_lines(m))
             lines.append("-----")
         elif state == "running" and has_public:
             err = snap["metrics_err"].get(box["id"])
