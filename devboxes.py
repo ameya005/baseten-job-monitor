@@ -856,9 +856,9 @@ def _truncate(text: str, n: int) -> str:
     return text if len(text) <= n else text[: n - 1] + "…"
 
 
-# A literal "|" is SwiftBar's text/params separator, so the menu bar title
-# uses the box-drawing bar, which looks the same.
-SEP = " │ "
+# Menu bar title separator: a dot with extra breathing room. (A literal "|"
+# can't be used; it is SwiftBar's text/params separator.)
+SEP = "  ·  "
 
 
 def title_preview(box: dict, m: dict | None) -> str:
