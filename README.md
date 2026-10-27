@@ -26,7 +26,7 @@ Two macOS menu bar plugins for [SwiftBar](https://github.com/swiftbar/SwiftBar):
 - Live usage inside each box's menu, updated every 2 seconds: CPU % with core count and load average, RAM, swap (when in use), disk on `/`, and on GPU boxes each GPU's utilization, VRAM, and temperature from `nvidia-smi`. A compact `CPU 32% · RAM 41% · GPU 87%` summary sits on the box's main line. Rows turn orange above 70% and red above 90%.
 - A process table under the usage bars shows what is actually running on the box, grouped by project and command rather than by process, e.g. `822% cpu 6.5% mem 18m  10× [ocr-bench-scoring] python -m ocr_bench.cli rescore --datasets …`. The project label comes from the virtualenv or repo directory in the command path. Identical workers collapse into one row with a count, long paths are shortened, and processes running as another user are marked. GPU boxes also list which process holds how much VRAM.
 - Each box keeps one persistent SSH session open for the metrics stream. If the connection drops (laptop sleep, network change) it reconnects by itself, and stale readings are labelled.
-- Clicking a running box opens an SSH session in Terminal (or an SSM session if the box has no public address). Clicking a stopped box opens it in the AWS console.
+- Clicking a box pins it to the menu bar (clicking the pinned one unpins it). SSH, htop, SSM, and the AWS console are options in the box's submenu.
 - Submenu actions: open `htop` in Terminal, open in the AWS console, connect via SSM or SSH, copy the IP or instance ID, start a stopped box, or stop a running one (with a confirmation dialog)
 - A "Sign in" action appears in the menu when your AWS session has expired
 

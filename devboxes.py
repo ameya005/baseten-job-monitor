@@ -1056,18 +1056,15 @@ def render(snap: dict) -> str:
         url = console_url(box, cfg)
         host = box.get("public_dns") or box.get("public_ip") or ""
         has_public = bool(host)
-        if state == "running" and has_public:
-            click = f"{me} param2=--aws-ssh param3={box['id']} param4={host} terminal=false"
-        elif state == "running":
-            click = f"{me} param2=--aws-ssm param3={box['id']} terminal=false"
-        else:
-            click = f"href={url}"
+        is_pinned = bool(cfg.get("pinned")) and cfg["pinned"] in (box["id"], name)
+        # Clicking a box pins it to the menu bar (or unpins the pinned one).
+        # SSH / SSM / console are options in its submenu.
+        click = f"{me} param2={'--aws-unpin' if is_pinned else '--aws-pin param3=' + box['id']} terminal=false"
 
         entry = snap["metrics"].get(box["id"])
         m = entry["m"] if entry else None
         age = now - entry["at"] if entry else 0
         summary = f" · {metrics_summary(m)}" if m else ""
-        is_pinned = bool(cfg.get("pinned")) and cfg["pinned"] in (box["id"], name)
         pin_flag = " checked=true" if is_pinned else ""
         lines.append(f"{name} — {state}{up_label}{type_label}{summary} | {icon} {click}{pin_flag}")
 
