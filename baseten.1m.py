@@ -3,8 +3,15 @@
 # <swiftbar.hideRunInTerminal>true</swiftbar.hideRunInTerminal>
 # <swiftbar.hideDisablePlugin>true</swiftbar.hideDisablePlugin>
 
-"""SwiftBar plugin: Baseten training job monitor. Refreshes every 1 minute."""
+"""SwiftBar plugin: Baseten training job monitor. Refreshes every 1 minute.
 
+AWS dev boxes live in the companion streaming plugin, devboxes.py.
+"""
+
+from __future__ import annotations
+
+import base64
+import json
 import os
 import re
 import shlex
@@ -186,17 +193,34 @@ def parse_projects(raw: str) -> list[dict]:
     return projects
 
 
-def status_emoji(status: str) -> str:
+GREEN, ORANGE, RED, GREY = "#34c759", "#ff9f0a", "#ff453a", "#8e8e93"
+
+
+def sf_icon(symbol: str, color: str = "", scale: str = "medium") -> str:
+    """SwiftBar params for a colored SF Symbol menu icon.
+
+    SwiftBar colors `sfimage` icons through `sfconfig`, a base64 JSON blob
+    (`sfcolor` only applies to symbols embedded inline in the text).
+    """
+    if not color:
+        return f"sfimage={symbol}"
+    cfg = {"renderingMode": "Hierarchical", "colors": [color], "scale": scale}
+    b64 = base64.b64encode(json.dumps(cfg, separators=(",", ":")).encode()).decode()
+    return f"sfimage={symbol} sfconfig={b64}"
+
+
+def status_icon(status: str) -> str:
+    """SwiftBar params for a Baseten job status icon (SF Symbol + color)."""
     s = status.upper()
     if "RUNNING" in s:
-        return "🟢"
+        return sf_icon("circle.fill", GREEN)
     if "CREATED" in s:
-        return "🟡"
-    if "FAILED" in s or "DEPLOY_FAILED" in s:
-        return "🔴"
+        return sf_icon("circle.fill", ORANGE)
+    if "FAILED" in s:
+        return sf_icon("circle.fill", RED)
     if "STOPPED" in s or "COMPLETED" in s:
-        return "⚫"
-    return "⚪"
+        return sf_icon("circle.fill", GREY)
+    return sf_icon("circle", GREY)
 
 
 def parse_gpu_info(instance: str) -> str:
@@ -378,7 +402,7 @@ def main():
         created_by = job.get("Created By", "")
         created_at = job.get("Created", "")
         elapsed = elapsed_time(created_at)
-        emoji = status_emoji(status)
+        icon = status_icon(status)
         short = short_status(status)
 
         url = f"https://app.baseten.co/training/{project_id}/logs/{job_id}"
@@ -386,7 +410,7 @@ def main():
         gpu = parse_gpu_info(instance)
         gpu_label = f" [{gpu}]" if gpu else ""
         elapsed_label = f" · {elapsed}" if elapsed else ""
-        print(f"{emoji} {job_name} — {short}{elapsed_label}{gpu_label} | href={url}")
+        print(f"{job_name} — {short}{elapsed_label}{gpu_label} | {icon} href={url}")
         print(f"--Job ID: {job_id} | font=monospace size=12")
         print(f"--Instance: {instance} | size=12")
         if created_by:
