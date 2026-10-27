@@ -65,6 +65,7 @@ ALLOWED_KEYS = {
     "BTMON_DEV_BOXES",
     "BTMON_SSH_USER",
     "BTMON_SSH_KEY",
+    "BTMON_PINNED",   # instance ID or Name tag of the box shown in the menu bar
 }
 # Credentials belong to the AWS CLI's own credential chain, never to this file.
 FORBIDDEN_KEYS = {
@@ -110,6 +111,7 @@ def load_config() -> dict:
         "boxes": [],
         "ssh_user": "",
         "ssh_key": "",
+        "pinned": "",
         "configured": False,
         "error": "",
         "warnings": [],
@@ -189,10 +191,47 @@ def load_config() -> dict:
                 cfg["warnings"].append(f"SSH key {problem}; run chmod 600 on it")
                 ssh_key = ""
 
+    pinned = values.get("BTMON_PINNED", "").strip()
+    if pinned and not (INSTANCE_ID_RE.fullmatch(pinned) or INSTANCE_NAME_RE.fullmatch(pinned)):
+        cfg["warnings"].append("Ignoring BTMON_PINNED: unexpected characters")
+        pinned = ""
+
     cfg.update(
-        profile=profile, region=region, ssh_user=ssh_user, ssh_key=ssh_key, configured=True
+        profile=profile, region=region, ssh_user=ssh_user, ssh_key=ssh_key,
+        pinned=pinned, configured=True,
     )
     return cfg
+
+
+def write_config_key(key: str, value: str) -> str:
+    """Set (or remove, when value is '') one key in aws.env, keeping the rest.
+
+    Returns an error message or ''. Refuses to touch an unsafe file.
+    """
+    if key not in ALLOWED_KEYS:
+        return f"Refusing to write unknown key {key}"
+    problem = _secure_file_problem(CONFIG_PATH) if os.path.exists(CONFIG_PATH) else ""
+    if problem:
+        return f"Refusing to edit {CONFIG_PATH}: {problem}"
+    lines: list[str] = []
+    if os.path.exists(CONFIG_PATH):
+        with open(CONFIG_PATH, encoding="utf-8") as fh:
+            lines = fh.read().splitlines()
+    kept = [
+        ln for ln in lines
+        if not (ln.strip() and not ln.lstrip().startswith("#")
+                and ln.partition("=")[0].strip().upper() == key)
+    ]
+    if value:
+        kept.append(f"{key}={value}")
+    os.makedirs(CONFIG_DIR, mode=0o700, exist_ok=True)
+    tmp = CONFIG_PATH + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(kept).rstrip("\n") + "\n")
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, CONFIG_PATH)
+    return ""
 
 
 # --------------------------------------------------------------------------
@@ -700,26 +739,43 @@ def render(snap: dict) -> str:
     else:
         boxes = fetched["boxes"]
         running = [b for b in boxes if b.get("state") == "running"]
-        cpus, gpus = [], []
-        for b in running:
-            entry = snap["metrics"].get(b["id"])
-            if entry and now - entry["at"] <= STALE_AFTER:
-                m = entry["m"]
-                if m.get("cpu_pct") is not None:
-                    cpus.append(m["cpu_pct"])
-                gpus += [g["util_pct"] for g in m.get("gpus", []) if g.get("util_pct") is not None]
-        text = f"{len(running)}/{len(boxes)}"
-        if cpus:
-            text += f" · CPU {max(cpus)}%"
-        if gpus:
-            text += f" · GPU {max(gpus)}%"
-        if any(b.get("impaired") for b in running):
-            icon = sf_icon("exclamationmark.triangle.fill", RED)
-        elif running:
-            icon = sf_icon("server.rack", GREEN)
+        pinned = next(
+            (b for b in boxes if cfg.get("pinned") and cfg["pinned"] in (b["id"], b.get("name"))
+             and not b.get("missing")),
+            None,
+        )
+        if pinned:
+            # One box in the menu bar: its name plus its live usage.
+            entry = snap["metrics"].get(pinned["id"])
+            text = pinned.get("name", pinned["id"])
+            if pinned.get("state") != "running":
+                text += f" · {pinned.get('state', 'unknown')}"
+            elif entry and now - entry["at"] <= STALE_AFTER:
+                summary = metrics_summary(entry["m"])
+                if summary:
+                    text += f" · {summary}"
+            lines.append(f"{text} | {box_icon(pinned)}")
         else:
-            icon = sf_icon("server.rack", GREY)
-        lines.append(f"{text} | {icon}")
+            cpus, gpus = [], []
+            for b in running:
+                entry = snap["metrics"].get(b["id"])
+                if entry and now - entry["at"] <= STALE_AFTER:
+                    m = entry["m"]
+                    if m.get("cpu_pct") is not None:
+                        cpus.append(m["cpu_pct"])
+                    gpus += [g["util_pct"] for g in m.get("gpus", []) if g.get("util_pct") is not None]
+            text = f"{len(running)}/{len(boxes)}"
+            if cpus:
+                text += f" · CPU {max(cpus)}%"
+            if gpus:
+                text += f" · GPU {max(gpus)}%"
+            if any(b.get("impaired") for b in running):
+                icon = sf_icon("exclamationmark.triangle.fill", RED)
+            elif running:
+                icon = sf_icon("server.rack", GREEN)
+            else:
+                icon = sf_icon("server.rack", GREY)
+            lines.append(f"{text} | {icon}")
 
     lines.append("---")
 
@@ -778,7 +834,9 @@ def render(snap: dict) -> str:
         age = now - entry["at"] if entry else 0
         summary = f"   {metrics_summary(m)}" if m else ""
         state_label = "" if state == "running" else f" — {state}"
-        lines.append(f"{name}{state_label}{type_label}{up_label}{summary} | {icon} {click}")
+        is_pinned = bool(cfg.get("pinned")) and cfg["pinned"] in (box["id"], name)
+        pin_flag = " checked=true" if is_pinned else ""
+        lines.append(f"{name}{state_label}{type_label}{up_label}{summary} | {icon} {click}{pin_flag}")
 
         if m:
             lines.extend(metrics_lines(m, age))
@@ -807,6 +865,10 @@ def render(snap: dict) -> str:
         if state == "running":
             lines.append(f"--Connect via SSM (Terminal) | {sf_icon('network')} {me} param2=--aws-ssm param3={box['id']} terminal=false")
         lines.append(f"--Open in AWS Console | {sf_icon('safari')} href={url}")
+        if is_pinned:
+            lines.append(f"--Unpin from menu bar | {sf_icon('pin.slash')} {me} param2=--aws-unpin terminal=false")
+        else:
+            lines.append(f"--Pin to menu bar | {sf_icon('pin')} {me} param2=--aws-pin param3={box['id']} terminal=false")
         if box.get("public_ip"):
             lines.append(
                 f"--Copy Public IP | {sf_icon('doc.on.doc')} bash=/bin/bash param1=-c "
@@ -950,6 +1012,18 @@ def action(name: str, instance_id: str, host: str = "") -> None:
 
     if name == "--aws-login":
         run_interactive(aws_login_cmd(cfg), "AWS sign in")
+        return
+
+    if name in ("--aws-pin", "--aws-unpin"):
+        if name == "--aws-pin" and not INSTANCE_ID_RE.fullmatch(instance_id):
+            notify(f"Invalid instance ID: {instance_id[:40]}")
+            return
+        err = write_config_key("BTMON_PINNED", instance_id if name == "--aws-pin" else "")
+        if err:
+            notify(err)
+            return
+        # Restart the stream so the menu bar switches right away.
+        subprocess.run(["/usr/bin/open", "-g", "swiftbar://refreshplugin?name=devboxes"], capture_output=True)
         return
 
     if not INSTANCE_ID_RE.fullmatch(instance_id):
@@ -1102,6 +1176,8 @@ def setup() -> None:
         lines.append(f"BTMON_SSH_USER={ssh_user}")
     if ssh_key:
         lines.append(f"BTMON_SSH_KEY={ssh_key}")
+    if existing.get("pinned"):
+        lines.append(f"BTMON_PINNED={existing['pinned']}")
 
     os.makedirs(CONFIG_DIR, mode=0o700, exist_ok=True)
     fd = os.open(CONFIG_PATH, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
@@ -1112,14 +1188,14 @@ def setup() -> None:
     subprocess.run(["/usr/bin/open", "-g", "swiftbar://refreshplugin?name=devboxes"], capture_output=True)
 
 
-INSTANCE_ACTIONS = {"--aws-start", "--aws-stop", "--aws-ssm", "--aws-ssh", "--aws-htop"}
+INSTANCE_ACTIONS = {"--aws-start", "--aws-stop", "--aws-ssm", "--aws-ssh", "--aws-htop", "--aws-pin"}
 
 if __name__ == "__main__":
     args = sys.argv[1:]
     if len(args) in (2, 3) and args[0] in INSTANCE_ACTIONS:
         action(args[0], args[1], args[2] if len(args) == 3 else "")
-    elif args == ["--aws-login"]:
-        action("--aws-login", "")
+    elif args in (["--aws-login"], ["--aws-unpin"]):
+        action(args[0], "")
     elif args == ["--aws-setup"]:
         if sys.stdin.isatty():
             setup()

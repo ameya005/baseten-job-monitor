@@ -21,6 +21,7 @@ Two macOS menu bar plugins for [SwiftBar](https://github.com/swiftbar/SwiftBar):
 ### AWS dev boxes (optional, `devboxes.py`)
 
 - Its own menu bar item with a server icon (green when boxes are up) and a live summary, e.g. `2/2 · CPU 21% · GPU 87%`
+- **Pin to menu bar** in any box's dropdown puts that one box in the menu bar instead, by name with its live usage, e.g. `Ishaan-extend · CPU 21% · RAM 35% · GPU 0%`. The pinned box shows a checkmark in the list; **Unpin from menu bar** goes back to the summary.
 - Per-box state icon: green power for running, orange hourglass for pending, grey moon for stopped, red warning for impaired status checks. Plus instance type, uptime, public and private IP.
 - Live usage inside each box's menu, updated every 2 seconds: CPU % with core count and load average, RAM, swap (when in use), disk on `/`, and on GPU boxes each GPU's utilization, VRAM, and temperature from `nvidia-smi`. A compact `CPU 32% · RAM 41% · GPU 87%` summary sits on the box's main line. Bars turn orange above 70% and red above 90%.
 - Each box keeps one persistent SSH session open for the metrics stream. If the connection drops (laptop sleep, network change) it reconnects by itself, and stale readings are labelled.
@@ -91,6 +92,7 @@ AWS_REGION=us-east-2          # optional; defaults to the profile's region
 BTMON_DEV_BOXES=i-0123456789abcdef0,my-box-name   # instance IDs or Name tags
 BTMON_SSH_USER=ubuntu         # optional; blank means rely on ~/.ssh/config
 BTMON_SSH_KEY=~/.ssh/my-key.pem   # optional; passed to `ssh -i`, must be mode 0600
+BTMON_PINNED=i-0123456789abcdef0  # optional; set by "Pin to menu bar" in the dropdown
 ```
 
 Any of those keys can also be set as environment variables, which take priority over the file.
