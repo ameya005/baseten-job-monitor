@@ -11,6 +11,8 @@ reads AWS credentials itself; it calls the `aws` CLI, which uses whatever
 sign-in you already have (SSO / `aws login`, named profiles, etc).
 """
 
+from __future__ import annotations
+
 import configparser
 import json
 import os

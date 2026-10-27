@@ -29,7 +29,7 @@ A macOS menu bar plugin that monitors your [Baseten](https://www.baseten.co/) tr
 ## Prerequisites
 
 - macOS
-- Python 3.10+
+- Python 3.9+ (the macOS system Python works)
 - [SwiftBar](https://github.com/swiftbar/SwiftBar)
 - [Truss CLI](https://docs.baseten.co/truss/overview) installed and authenticated
 - For AWS dev boxes: [AWS CLI v2](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html) installed and signed in (`aws login` or `aws sso login`)
