@@ -20,8 +20,8 @@ Two macOS menu bar plugins for [SwiftBar](https://github.com/swiftbar/SwiftBar):
 
 ### AWS dev boxes (optional, `devboxes.py`)
 
-- Its own menu bar item with a live summary, e.g. `EC2: 2/2 up · CPU 21% · RAM 43% · VRAM 6%`
-- **Pin to menu bar** in any box's dropdown puts that one box in the menu bar instead: instance type, short name, and live CPU, RAM, and VRAM, e.g. `g6.4xlarge · Ishaan-exte… · CPU 21% · RAM 35% · VRAM 6%`. The pinned box shows a checkmark in the list; **Unpin from menu bar** goes back to the summary.
+- Its own menu bar item with a live summary, e.g. `EC2: 2/2 up │ CPU 21% │ RAM 43% │ VRAM 6%`
+- **Pin to menu bar** in any box's dropdown puts that one box in the menu bar instead: instance type, short name, and live CPU, RAM, and VRAM, e.g. `g6.4xlarge │ Ishaan-exte… │ CPU 21% │ RAM 35% │ VRAM 6%`. The pinned box shows a checkmark in the list; **Unpin from menu bar** goes back to the summary.
 - Per-box state dot (green running, orange pending, grey stopped, red impaired), instance type, uptime, public and private IP.
 - Live usage inside each box's menu, updated every 2 seconds: CPU % with core count and load average, RAM, swap (when in use), disk on `/`, and on GPU boxes each GPU's utilization, VRAM, and temperature from `nvidia-smi`. A compact `CPU 32% · RAM 41% · GPU 87%` summary sits on the box's main line. Rows turn orange above 70% and red above 90%.
 - A process table under the usage bars shows what is actually running on the box, grouped by project and command rather than by process, e.g. `822% cpu 6.5% mem 18m  10× [ocr-bench-scoring] python -m ocr_bench.cli rescore --datasets …`. The project label comes from the virtualenv or repo directory in the command path. Identical workers collapse into one row with a count, long paths are shortened, and processes running as another user are marked. GPU boxes also list which process holds how much VRAM.

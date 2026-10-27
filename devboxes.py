@@ -856,23 +856,24 @@ def _truncate(text: str, n: int) -> str:
     return text if len(text) <= n else text[: n - 1] + "…"
 
 
+# A literal "|" is SwiftBar's text/params separator, so the menu bar title
+# uses the box-drawing bar, which looks the same.
+SEP = " │ "
+
+
 def title_preview(box: dict, m: dict | None) -> str:
-    """Menu bar text for one box: SKU, short name, CPU · RAM · VRAM."""
+    """Menu bar text for one box: SKU │ short name │ CPU │ RAM │ VRAM."""
     parts = [box.get("type", ""), _truncate(box.get("name", box["id"]), 12)]
-    text = " · ".join(p for p in parts if p)
     if m:
-        bits = []
         if m.get("cpu_pct") is not None:
-            bits.append(f"CPU {m['cpu_pct']}%")
+            parts.append(f"CPU {m['cpu_pct']}%")
         mem = _pct(m.get("mem_used_mb"), m.get("mem_total_mb"))
         if mem is not None:
-            bits.append(f"RAM {mem:.0f}%")
+            parts.append(f"RAM {mem:.0f}%")
         vram = _vram_pct(m)
         if vram is not None:
-            bits.append(f"VRAM {vram:.0f}%")
-        if bits:
-            text += " · " + " · ".join(bits)
-    return text
+            parts.append(f"VRAM {vram:.0f}%")
+    return SEP.join(p for p in parts if p)
 
 
 def metrics_lines(m: dict, age: float) -> list[str]:
@@ -1000,11 +1001,11 @@ def render(snap: dict) -> str:
                         vrams.append(vram)
             text = f"EC2: {len(running)}/{len(boxes)} up"
             if cpus:
-                text += f" · CPU {max(cpus)}%"
+                text += f"{SEP}CPU {max(cpus)}%"
             if rams:
-                text += f" · RAM {max(rams):.0f}%"
+                text += f"{SEP}RAM {max(rams):.0f}%"
             if vrams:
-                text += f" · VRAM {max(vrams):.0f}%"
+                text += f"{SEP}VRAM {max(vrams):.0f}%"
             if any(b.get("impaired") for b in running):
                 lines.append(f"{text} ⚠ | color=red")
             else:
