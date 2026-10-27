@@ -1,0 +1,1076 @@
+#!/usr/bin/env python3
+# <swiftbar.type>streamable</swiftbar.type>
+# <swiftbar.hideAbout>true</swiftbar.hideAbout>
+# <swiftbar.hideRunInTerminal>true</swiftbar.hideRunInTerminal>
+# <swiftbar.hideDisablePlugin>true</swiftbar.hideDisablePlugin>
+
+"""SwiftBar streaming plugin: live AWS EC2 dev box monitor.
+
+This plugin stays running. It polls EC2 for instance state once a minute and
+keeps one SSH session open per running box, which reports CPU, RAM, disk and
+GPU usage every ~2 seconds. The menu redraws every 2 seconds, like a tiny htop.
+
+Security model:
+  * The plugin never handles AWS credentials. Every AWS call goes through the
+    `aws` CLI, which uses the user's own sign-in (SSO / `aws login`, named
+    profiles, credential_process, ...). Nothing secret is written anywhere by
+    this script.
+  * The only per-user config is a small KEY=VALUE file that says which profile,
+    region, and instances to show, plus the SSH user and key *path*. It is
+    parsed as plain text (never sourced or executed), must be owned by the
+    user with mode 0600, and may not contain credential-looking keys.
+  * Usage metrics are collected over the user's own SSH access, in batch mode
+    (never prompts), by piping a short fixed script to `sh` on the box.
+  * Every subprocess call uses an argument list (no shell), and instance IDs /
+    names from config are validated against strict patterns.
+"""
+
+from __future__ import annotations
+
+import base64
+import configparser
+import json
+import os
+import re
+import shlex
+import stat
+import subprocess
+import sys
+import threading
+import time
+from datetime import datetime
+
+_extra_paths = [
+    os.path.expanduser("~/.local/bin"),
+    os.path.expanduser("~/.local/share/mise/shims"),
+    "/opt/homebrew/bin",
+    "/usr/local/bin",
+]
+os.environ["PATH"] = (
+    ":".join(p for p in _extra_paths if os.path.isdir(p))
+    + ":"
+    + os.environ.get("PATH", "")
+)
+
+# --------------------------------------------------------------------------
+# Config
+# --------------------------------------------------------------------------
+
+CONFIG_DIR = os.path.expanduser("~/.config/baseten-job-monitor")
+CONFIG_PATH = os.path.join(CONFIG_DIR, "aws.env")
+
+ALLOWED_KEYS = {
+    "AWS_PROFILE",
+    "AWS_REGION",
+    "BTMON_DEV_BOXES",
+    "BTMON_SSH_USER",
+    "BTMON_SSH_KEY",
+}
+# Credentials belong to the AWS CLI's own credential chain, never to this file.
+FORBIDDEN_KEYS = {
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "AWS_SECURITY_TOKEN",
+}
+
+INSTANCE_ID_RE = re.compile(r"i-[0-9a-f]{8,17}")
+INSTANCE_NAME_RE = re.compile(r"[A-Za-z0-9._\-]{1,128}")
+SSH_USER_RE = re.compile(r"[A-Za-z0-9._\-]{1,32}")
+PROFILE_RE = re.compile(r"[A-Za-z0-9._\-]{1,64}")
+REGION_RE = re.compile(r"[a-z]{2}(-[a-z]+)+-\d")
+
+AWS_TIMEOUT = 25           # seconds for a single aws CLI call
+EC2_POLL_INTERVAL = 60     # seconds between EC2 state polls
+RENDER_INTERVAL = 2.0      # seconds between menu redraws
+METRICS_PERIOD = 2.0       # target seconds between usage samples on the box
+STALE_AFTER = 10           # seconds without a sample before usage is marked stale
+SSH_RETRY_DELAY = 6        # seconds before reconnecting a dropped SSH session
+
+
+def _secure_file_problem(path: str) -> str:
+    """Return why a file is unsafe to trust ('' if fine)."""
+    try:
+        st = os.stat(path)
+    except FileNotFoundError:
+        return ""
+    if st.st_uid != os.getuid():
+        return "not owned by you"
+    if st.st_mode & (stat.S_IRWXG | stat.S_IRWXO):
+        return f"permissions are {oct(st.st_mode & 0o777)}, must be 0600"
+    return ""
+
+
+def load_config() -> dict:
+    """Load dev box settings. Environment variables override the file."""
+    cfg = {
+        "profile": "",
+        "region": "",
+        "boxes": [],
+        "ssh_user": "",
+        "ssh_key": "",
+        "configured": False,
+        "error": "",
+        "warnings": [],
+    }
+    values: dict[str, str] = {}
+
+    if os.path.exists(CONFIG_PATH):
+        problem = _secure_file_problem(CONFIG_PATH)
+        if problem:
+            cfg["error"] = f"Refusing to read {CONFIG_PATH}: {problem}"
+            return cfg
+        try:
+            with open(CONFIG_PATH, encoding="utf-8") as fh:
+                for lineno, line in enumerate(fh, 1):
+                    line = line.strip()
+                    if not line or line.startswith("#") or "=" not in line:
+                        continue
+                    key, _, val = line.partition("=")
+                    key = key.strip().upper()
+                    val = val.split(" #", 1)[0].strip().strip("'\"")
+                    if key in FORBIDDEN_KEYS:
+                        cfg["error"] = (
+                            f"{key} found in aws.env (line {lineno}). Credentials must not be "
+                            "stored here; sign in with the AWS CLI instead."
+                        )
+                        return cfg
+                    if key in ALLOWED_KEYS:
+                        values[key] = val
+                    else:
+                        cfg["warnings"].append(f"Ignoring unknown key {key} in aws.env")
+        except OSError as exc:
+            cfg["error"] = f"Could not read aws.env: {exc}"
+            return cfg
+
+    for key in ALLOWED_KEYS:
+        if os.environ.get(key):
+            values[key] = os.environ[key]
+
+    boxes_raw = values.get("BTMON_DEV_BOXES", "")
+    if not boxes_raw:
+        return cfg
+
+    for item in boxes_raw.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if INSTANCE_ID_RE.fullmatch(item) or INSTANCE_NAME_RE.fullmatch(item):
+            cfg["boxes"].append(item)
+        else:
+            cfg["warnings"].append(f"Ignoring invalid dev box entry: {item[:40]!r}")
+    if not cfg["boxes"]:
+        cfg["error"] = "BTMON_DEV_BOXES has no valid instance IDs or names"
+        return cfg
+
+    profile = values.get("AWS_PROFILE", "").strip()
+    if profile and not PROFILE_RE.fullmatch(profile):
+        cfg["error"] = "AWS_PROFILE contains unexpected characters"
+        return cfg
+    region = values.get("AWS_REGION", "").strip()
+    if region and not REGION_RE.fullmatch(region):
+        cfg["error"] = f"AWS_REGION does not look like a region: {region!r}"
+        return cfg
+    ssh_user = values.get("BTMON_SSH_USER", "").strip()
+    if ssh_user and not SSH_USER_RE.fullmatch(ssh_user):
+        cfg["warnings"].append("Ignoring BTMON_SSH_USER: unexpected characters")
+        ssh_user = ""
+
+    # The key is only ever passed to `ssh -i`; the plugin never reads it.
+    ssh_key = os.path.expanduser(values.get("BTMON_SSH_KEY", "").strip())
+    if ssh_key:
+        if not os.path.isfile(ssh_key):
+            cfg["warnings"].append(f"BTMON_SSH_KEY not found: {ssh_key}")
+            ssh_key = ""
+        else:
+            problem = _secure_file_problem(ssh_key)
+            if problem:
+                cfg["warnings"].append(f"SSH key {problem}; run chmod 600 on it")
+                ssh_key = ""
+
+    cfg.update(
+        profile=profile, region=region, ssh_user=ssh_user, ssh_key=ssh_key, configured=True
+    )
+    return cfg
+
+
+# --------------------------------------------------------------------------
+# AWS CLI
+# --------------------------------------------------------------------------
+
+def aws_base_cmd(cfg: dict) -> list[str]:
+    cmd = ["aws", "--output", "json", "--no-cli-pager"]
+    if cfg.get("profile"):
+        cmd += ["--profile", cfg["profile"]]
+    if cfg.get("region"):
+        cmd += ["--region", cfg["region"]]
+    return cmd
+
+
+def aws_login_cmd(cfg: dict) -> list[str]:
+    """Pick the sign-in command that matches the profile's config."""
+    profile = cfg.get("profile") or os.environ.get("AWS_PROFILE") or "default"
+    section = "default" if profile == "default" else f"profile {profile}"
+    parser = configparser.RawConfigParser()
+    try:
+        parser.read(os.path.expanduser("~/.aws/config"), encoding="utf-8")
+    except (configparser.Error, OSError):
+        pass
+    keys = set(parser[section].keys()) if parser.has_section(section) else set()
+    profile_args = ["--profile", profile] if cfg.get("profile") else []
+    if "login_session" in keys:
+        return ["aws", "login", *profile_args]
+    if "sso_session" in keys or "sso_start_url" in keys:
+        return ["aws", "sso", "login", *profile_args]
+    return ["aws", "login", *profile_args]
+
+
+def _looks_like_auth_error(stderr: str) -> bool:
+    s = stderr.lower()
+    return any(n in s for n in (
+        "token has expired", "expiredtoken", "unable to locate credentials",
+        "sso session", "aws login", "aws sso login", "invalid grant",
+        "refresh token", "could not refresh", "no credentials",
+        "credentials were not found",
+    ))
+
+
+def _run_aws(cmd: list[str]) -> tuple[int, str, str]:
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=AWS_TIMEOUT)
+    except FileNotFoundError:
+        return 127, "", "aws CLI not found in PATH"
+    except subprocess.TimeoutExpired:
+        return 124, "", f"aws timed out after {AWS_TIMEOUT}s"
+    return result.returncode, result.stdout, result.stderr
+
+
+def _instance_from_json(inst: dict) -> dict:
+    tags = {t.get("Key"): t.get("Value") for t in inst.get("Tags", []) or []}
+    az = inst.get("Placement", {}).get("AvailabilityZone", "")
+    region = az[:-1] if re.fullmatch(r"[a-z]{2}(-[a-z]+)+-\d[a-z]", az) else ""
+    return {
+        "id": inst.get("InstanceId", ""),
+        "name": tags.get("Name", "") or inst.get("InstanceId", ""),
+        "state": inst.get("State", {}).get("Name", "unknown"),
+        "type": inst.get("InstanceType", ""),
+        "public_ip": inst.get("PublicIpAddress", ""),
+        "public_dns": inst.get("PublicDnsName", ""),
+        "private_ip": inst.get("PrivateIpAddress", ""),
+        "launch_time": inst.get("LaunchTime", ""),
+        "az": az,
+        "region": region,
+        "status_checks": "",
+    }
+
+
+def fetch_dev_boxes(cfg: dict) -> dict:
+    """Query EC2 for the configured boxes.
+
+    Returns {"boxes": [...], "error": str, "auth_error": bool}.
+    """
+    out = {"boxes": [], "error": "", "auth_error": False}
+    ids = [b for b in cfg["boxes"] if INSTANCE_ID_RE.fullmatch(b)]
+    names = [b for b in cfg["boxes"] if not INSTANCE_ID_RE.fullmatch(b)]
+
+    # Filters (not --instance-ids) so a stale ID does not fail the whole call.
+    calls = []
+    if ids:
+        calls.append(["--filters", f"Name=instance-id,Values={','.join(ids)}"])
+    if names:
+        calls.append(["--filters", f"Name=tag:Name,Values={','.join(names)}"])
+
+    found: dict[str, dict] = {}
+    for extra in calls:
+        code, stdout, stderr = _run_aws(aws_base_cmd(cfg) + ["ec2", "describe-instances", *extra])
+        if code != 0:
+            lines = stderr.strip().splitlines()
+            out["error"] = (lines[-1] if lines else f"aws exited {code}")[:200]
+            out["auth_error"] = _looks_like_auth_error(stderr)
+            return out
+        try:
+            data = json.loads(stdout or "{}")
+        except json.JSONDecodeError:
+            out["error"] = "Could not parse aws output"
+            return out
+        for res in data.get("Reservations", []):
+            for inst in res.get("Instances", []):
+                box = _instance_from_json(inst)
+                if box["state"] != "terminated":
+                    found[box["id"]] = box
+
+    running_ids = [b["id"] for b in found.values() if b["state"] == "running"]
+    if running_ids:
+        code, stdout, _ = _run_aws(
+            aws_base_cmd(cfg) + ["ec2", "describe-instance-status", "--instance-ids", *running_ids]
+        )
+        if code == 0:
+            try:
+                for st in json.loads(stdout or "{}").get("InstanceStatuses", []):
+                    iid = st.get("InstanceId")
+                    if iid in found:
+                        sys_ok = st.get("SystemStatus", {}).get("Status", "")
+                        inst_ok = st.get("InstanceStatus", {}).get("Status", "")
+                        found[iid]["status_checks"] = f"system={sys_ok} instance={inst_ok}"
+                        found[iid]["impaired"] = "impaired" in (sys_ok + inst_ok)
+            except json.JSONDecodeError:
+                pass
+
+    ordered = []
+    for entry in cfg["boxes"]:
+        matches = [b for b in found.values() if entry in (b["id"], b["name"])]
+        for m in matches:
+            if m not in ordered:
+                ordered.append(m)
+        if not matches:
+            ordered.append({"id": entry, "name": entry, "state": "not found", "missing": True})
+    out["boxes"] = ordered
+    return out
+
+
+# --------------------------------------------------------------------------
+# SSH usage metrics (streamed)
+# --------------------------------------------------------------------------
+
+# Fed to `sh` on the box via stdin. Loops forever, printing one frame per
+# METRICS_PERIOD terminated by "@@END". The CPU figure is a real sample over
+# the sleep window rather than a since-boot average.
+REMOTE_METRICS_LOOP = r"""
+while :; do
+  set -- $(head -1 /proc/stat); u1=$(( $2+$3+$4+$7+$8+$9 )); i1=$(( $5+$6 ))
+  sleep %(sleep)s
+  set -- $(head -1 /proc/stat); u2=$(( $2+$3+$4+$7+$8+$9 )); i2=$(( $5+$6 ))
+  t=$(( (u2-u1)+(i2-i1) )); if [ "$t" -gt 0 ]; then cpu=$(( 100*(u2-u1)/t )); else cpu=0; fi
+  echo "CPU $cpu $(nproc 2>/dev/null || echo 0) $(cut -d' ' -f1-3 /proc/loadavg)"
+  free -m 2>/dev/null | awk '/^Mem:/{print "MEM",$3,$2} /^Swap:/{print "SWAP",$3,$2}'
+  df -Pm / 2>/dev/null | awk 'NR==2{print "DISK",$3,$2}'
+  if command -v nvidia-smi >/dev/null 2>&1; then
+    nvidia-smi --query-gpu=index,name,utilization.gpu,memory.used,memory.total,temperature.gpu \
+      --format=csv,noheader,nounits 2>/dev/null | sed 's/^/GPU /'
+  fi
+  echo "@@END"
+done
+""" % {"sleep": f"{METRICS_PERIOD:.1f}"}
+
+
+def ssh_base_cmd(cfg: dict, host: str, batch: bool = True) -> list[str]:
+    cmd = ["ssh"]
+    if cfg.get("ssh_key"):
+        cmd += ["-i", cfg["ssh_key"]]
+    if batch:
+        cmd += [
+            "-o", "BatchMode=yes",
+            "-o", "ConnectTimeout=8",
+            "-o", "StrictHostKeyChecking=accept-new",
+            "-o", "ServerAliveInterval=10",
+            "-o", "ServerAliveCountMax=2",
+            "-o", "LogLevel=ERROR",
+        ]
+    target = f"{cfg['ssh_user']}@{host}" if cfg.get("ssh_user") else host
+    cmd.append(target)
+    return cmd
+
+
+def parse_metrics(lines: list[str]) -> dict:
+    m: dict = {"gpus": []}
+    for line in lines:
+        parts = line.split()
+        if not parts:
+            continue
+        kind = parts[0]
+        try:
+            if kind == "CPU" and len(parts) >= 3:
+                m["cpu_pct"] = int(parts[1])
+                m["cores"] = int(parts[2])
+                m["load"] = " ".join(parts[3:6])
+            elif kind == "MEM" and len(parts) >= 3:
+                m["mem_used_mb"], m["mem_total_mb"] = int(parts[1]), int(parts[2])
+            elif kind == "SWAP" and len(parts) >= 3:
+                m["swap_used_mb"], m["swap_total_mb"] = int(parts[1]), int(parts[2])
+            elif kind == "DISK" and len(parts) >= 3:
+                m["disk_used_mb"], m["disk_total_mb"] = int(parts[1]), int(parts[2])
+            elif kind == "GPU":
+                cells = [c.strip() for c in line[4:].split(",")]
+                if len(cells) >= 5:
+                    m["gpus"].append({
+                        "index": cells[0],
+                        "name": re.sub(r"^NVIDIA\s+", "", cells[1]),
+                        "util_pct": int(cells[2]) if cells[2].isdigit() else None,
+                        "vram_used_mb": int(cells[3]) if cells[3].isdigit() else None,
+                        "vram_total_mb": int(cells[4]) if cells[4].isdigit() else None,
+                        "temp_c": int(cells[5]) if len(cells) > 5 and cells[5].isdigit() else None,
+                    })
+        except ValueError:
+            continue
+    return m
+
+
+class MetricsStream(threading.Thread):
+    """Keeps one SSH session to a box and parses usage frames as they arrive."""
+
+    def __init__(self, cfg: dict, box_id: str, host: str, state: "State"):
+        super().__init__(daemon=True, name=f"metrics-{box_id}")
+        self.cfg, self.box_id, self.host, self.state = cfg, box_id, host, state
+        self.stop_event = threading.Event()
+        self.proc: subprocess.Popen | None = None
+
+    def stop(self) -> None:
+        self.stop_event.set()
+        if self.proc and self.proc.poll() is None:
+            try:
+                self.proc.terminate()
+            except OSError:
+                pass
+
+    def run(self) -> None:
+        while not self.stop_event.is_set():
+            self._session()
+            if self.stop_event.is_set():
+                break
+            self.stop_event.wait(SSH_RETRY_DELAY)
+
+    def _session(self) -> None:
+        cmd = ssh_base_cmd(self.cfg, self.host) + ["sh"]
+        try:
+            self.proc = subprocess.Popen(
+                cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, bufsize=1,
+            )
+        except FileNotFoundError:
+            self.state.set_metrics_error(self.box_id, "ssh not found")
+            self.stop_event.set()
+            return
+        assert self.proc.stdin and self.proc.stdout and self.proc.stderr
+        self.proc.stdin.write(REMOTE_METRICS_LOOP)
+        self.proc.stdin.flush()
+        self.proc.stdin.close()  # sh reads the whole script, then runs the loop
+
+        frame: list[str] = []
+        for line in self.proc.stdout:
+            if self.stop_event.is_set():
+                break
+            line = line.rstrip("\n")
+            if line == "@@END":
+                self.state.set_metrics(self.box_id, parse_metrics(frame))
+                frame = []
+            else:
+                frame.append(line)
+        self.proc.wait()
+        if not self.stop_event.is_set():
+            err = self.proc.stderr.read().strip().splitlines()
+            msg = err[-1][:120] if err else f"ssh exited {self.proc.returncode}"
+            self.state.set_metrics_error(self.box_id, msg)
+
+
+class State:
+    """Shared state between the EC2 poller, the SSH streams, and the renderer."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.cfg = load_config()
+        self.fetched = {"boxes": [], "error": "", "auth_error": False}
+        self.metrics: dict[str, dict] = {}     # box_id -> {"m": {...}, "at": ts}
+        self.metrics_err: dict[str, str] = {}
+        self.streams: dict[str, MetricsStream] = {}
+        self.last_poll = 0.0
+
+    def set_metrics(self, box_id: str, m: dict) -> None:
+        with self.lock:
+            self.metrics[box_id] = {"m": m, "at": time.time()}
+            self.metrics_err.pop(box_id, None)
+
+    def set_metrics_error(self, box_id: str, msg: str) -> None:
+        with self.lock:
+            self.metrics_err[box_id] = msg
+
+    def poll_ec2(self) -> None:
+        cfg = load_config()  # re-read so edits to aws.env apply without restart
+        fetched = (
+            fetch_dev_boxes(cfg)
+            if cfg["configured"]
+            else {"boxes": [], "error": "", "auth_error": False}
+        )
+        with self.lock:
+            self.cfg, self.fetched, self.last_poll = cfg, fetched, time.time()
+            self._reconcile_streams_locked()
+
+    def _reconcile_streams_locked(self) -> None:
+        want: dict[str, str] = {}
+        for b in self.fetched["boxes"]:
+            host = b.get("public_dns") or b.get("public_ip")
+            if b.get("state") == "running" and host and not b.get("missing"):
+                want[b["id"]] = host
+        for box_id, stream in list(self.streams.items()):
+            if box_id not in want or stream.host != want[box_id] or not stream.is_alive():
+                stream.stop()
+                del self.streams[box_id]
+                self.metrics.pop(box_id, None)
+        for box_id, host in want.items():
+            if box_id not in self.streams:
+                s = MetricsStream(self.cfg, box_id, host, self)
+                self.streams[box_id] = s
+                s.start()
+
+    def snapshot(self) -> dict:
+        with self.lock:
+            return {
+                "cfg": self.cfg,
+                "fetched": self.fetched,
+                "metrics": dict(self.metrics),
+                "metrics_err": dict(self.metrics_err),
+                "last_poll": self.last_poll,
+            }
+
+
+# --------------------------------------------------------------------------
+# Rendering
+# --------------------------------------------------------------------------
+
+GREEN, ORANGE, RED, GREY, BLUE = "#34c759", "#ff9f0a", "#ff453a", "#8e8e93", "#0a84ff"
+
+
+def sf_icon(symbol: str, color: str = "", scale: str = "medium") -> str:
+    """SwiftBar params for a colored SF Symbol icon (color goes via sfconfig)."""
+    if not color:
+        return f"sfimage={symbol}"
+    cfg = {"renderingMode": "Hierarchical", "colors": [color], "scale": scale}
+    b64 = base64.b64encode(json.dumps(cfg, separators=(",", ":")).encode()).decode()
+    return f"sfimage={symbol} sfconfig={b64}"
+
+
+def box_icon(box: dict) -> str:
+    if box.get("missing"):
+        return sf_icon("questionmark.circle", GREY)
+    if box.get("impaired"):
+        return sf_icon("exclamationmark.triangle.fill", RED)
+    return {
+        "running": sf_icon("power.circle.fill", GREEN),
+        "pending": sf_icon("hourglass.circle.fill", ORANGE),
+        "stopping": sf_icon("power.circle", ORANGE),
+        "shutting-down": sf_icon("power.circle", ORANGE),
+        "stopped": sf_icon("moon.zzz.fill", GREY),
+        "terminated": sf_icon("xmark.circle.fill", RED),
+    }.get(box.get("state", ""), sf_icon("circle.dashed", GREY))
+
+
+def elapsed_time(created_at: str, now: datetime | None = None) -> str:
+    if not created_at:
+        return ""
+    value = created_at.strip()
+    if value.endswith("Z"):
+        value = value[:-1] + "+00:00"
+    try:
+        created = datetime.fromisoformat(value)
+    except ValueError:
+        return ""
+    if now is None:
+        now = datetime.now(created.tzinfo) if created.tzinfo else datetime.now()
+    seconds = max(0, int((now - created).total_seconds()))
+    minutes = seconds // 60
+    hours, minutes = divmod(minutes, 60)
+    days, hours = divmod(hours, 24)
+    if days:
+        return f"{days}d {hours}h"
+    if hours:
+        return f"{hours}h {minutes}m"
+    if minutes:
+        return f"{minutes}m"
+    return "<1m"
+
+
+def usage_bar(pct: float | None, width: int = 12) -> str:
+    if pct is None:
+        return "·" * width
+    filled = max(0, min(width, round(pct / 100 * width)))
+    return "▰" * filled + "▱" * (width - filled)
+
+
+def _gb(mb: int | None) -> str:
+    if mb is None:
+        return "?"
+    return f"{mb / 1024:.0f}" if mb >= 10240 else f"{mb / 1024:.1f}"
+
+
+def _pct(used: int | None, total: int | None) -> float | None:
+    if used is None or not total:
+        return None
+    return 100.0 * used / total
+
+
+def _usage_color(pct: float | None) -> str:
+    if pct is None:
+        return GREY
+    if pct >= 90:
+        return RED
+    if pct >= 70:
+        return ORANGE
+    return GREEN
+
+
+def _fmt_pct(p: float | None) -> str:
+    return "  ?" if p is None else f"{p:>3.0f}"
+
+
+def metrics_summary(m: dict) -> str:
+    bits = []
+    if m.get("cpu_pct") is not None:
+        bits.append(f"CPU {m['cpu_pct']}%")
+    mem = _pct(m.get("mem_used_mb"), m.get("mem_total_mb"))
+    if mem is not None:
+        bits.append(f"RAM {mem:.0f}%")
+    utils = [g["util_pct"] for g in m.get("gpus", []) if g.get("util_pct") is not None]
+    if utils:
+        bits.append(f"GPU {max(utils)}%")
+    return " · ".join(bits)
+
+
+def metrics_lines(m: dict, age: float) -> list[str]:
+    mono = "font=Menlo size=11"
+    out = []
+    stale = f"  (stale {age:.0f}s)" if age > STALE_AFTER else ""
+
+    cpu = m.get("cpu_pct")
+    tail = " · ".join(x for x in (
+        f"{m['cores']} cores" if m.get("cores") else "",
+        f"load {m['load']}" if m.get("load") else "",
+    ) if x)
+    out.append(f"--CPU  {usage_bar(cpu)} {_fmt_pct(cpu)}%  {tail}{stale} | {mono} {sf_icon('cpu', _usage_color(cpu))}")
+
+    mem = _pct(m.get("mem_used_mb"), m.get("mem_total_mb"))
+    if mem is not None:
+        out.append(
+            f"--RAM  {usage_bar(mem)} {_fmt_pct(mem)}%  {_gb(m['mem_used_mb'])}/{_gb(m['mem_total_mb'])} GB "
+            f"| {mono} {sf_icon('memorychip', _usage_color(mem))}"
+        )
+    swap = _pct(m.get("swap_used_mb"), m.get("swap_total_mb"))
+    if swap is not None and m.get("swap_used_mb", 0) > 0:
+        out.append(
+            f"--Swap {usage_bar(swap)} {_fmt_pct(swap)}%  {_gb(m['swap_used_mb'])}/{_gb(m['swap_total_mb'])} GB "
+            f"| {mono} {sf_icon('memorychip', _usage_color(swap))}"
+        )
+    for g in m.get("gpus", []):
+        util, vram = g.get("util_pct"), _pct(g.get("vram_used_mb"), g.get("vram_total_mb"))
+        temp = f" · {g['temp_c']}°C" if g.get("temp_c") is not None else ""
+        label = f"GPU{g['index']}" if len(m["gpus"]) > 1 else "GPU "
+        out.append(
+            f"--{label} {usage_bar(util)} {_fmt_pct(util)}%  {g['name']}{temp} "
+            f"| {mono} {sf_icon('rectangle.3.group', _usage_color(util))}"
+        )
+        out.append(
+            f"--VRAM {usage_bar(vram)} {_fmt_pct(vram)}%  {_gb(g['vram_used_mb'])}/{_gb(g['vram_total_mb'])} GB "
+            f"| {mono} {sf_icon('memorychip.fill', _usage_color(vram))}"
+        )
+    disk = _pct(m.get("disk_used_mb"), m.get("disk_total_mb"))
+    if disk is not None:
+        out.append(
+            f"--Disk {usage_bar(disk)} {_fmt_pct(disk)}%  {_gb(m['disk_used_mb'])}/{_gb(m['disk_total_mb'])} GB on / "
+            f"| {mono} {sf_icon('internaldrive', _usage_color(disk))}"
+        )
+    return out
+
+
+def console_url(box: dict, cfg: dict) -> str:
+    region = box.get("region") or cfg.get("region") or "us-east-1"
+    return (
+        f"https://{region}.console.aws.amazon.com/ec2/home?region={region}"
+        f"#InstanceDetails:instanceId={box['id']}"
+    )
+
+
+def render(snap: dict) -> str:
+    """Build the full menu text for one frame."""
+    cfg, fetched = snap["cfg"], snap["fetched"]
+    python = shlex.quote(sys.executable)
+    script = shlex.quote(os.path.abspath(__file__))
+    me = f"bash={python} param1={script}"
+    now = time.time()
+    lines: list[str] = []
+
+    # ---- title -----------------------------------------------------------
+    if not cfg["configured"]:
+        if cfg["error"]:
+            lines.append(f"EC2 | {sf_icon('exclamationmark.triangle.fill', RED)}")
+        else:
+            lines.append(f"EC2 | {sf_icon('server.rack', GREY)}")
+    elif fetched["auth_error"]:
+        lines.append(f"EC2 sign in | {sf_icon('lock.fill', ORANGE)} color=orange")
+    elif fetched["error"]:
+        lines.append(f"EC2 err | {sf_icon('exclamationmark.triangle.fill', RED)} color=red")
+    else:
+        boxes = fetched["boxes"]
+        running = [b for b in boxes if b.get("state") == "running"]
+        cpus, gpus = [], []
+        for b in running:
+            entry = snap["metrics"].get(b["id"])
+            if entry and now - entry["at"] <= STALE_AFTER:
+                m = entry["m"]
+                if m.get("cpu_pct") is not None:
+                    cpus.append(m["cpu_pct"])
+                gpus += [g["util_pct"] for g in m.get("gpus", []) if g.get("util_pct") is not None]
+        text = f"{len(running)}/{len(boxes)}"
+        if cpus:
+            text += f" · CPU {max(cpus)}%"
+        if gpus:
+            text += f" · GPU {max(gpus)}%"
+        if any(b.get("impaired") for b in running):
+            icon = sf_icon("exclamationmark.triangle.fill", RED)
+        elif running:
+            icon = sf_icon("server.rack", GREEN)
+        else:
+            icon = sf_icon("server.rack", GREY)
+        lines.append(f"{text} | {icon}")
+
+    lines.append("---")
+
+    # ---- body ------------------------------------------------------------
+    scope = " · ".join(x for x in (cfg.get("profile"), cfg.get("region")) if x)
+    lines.append("AWS Dev Boxes" + (f" ({scope})" if scope else "") + " | size=12 color=gray")
+
+    if not cfg["configured"]:
+        if cfg["error"]:
+            lines.append(f"{cfg['error']} | {sf_icon('exclamationmark.triangle.fill', RED)} color=red size=12")
+            if "permissions" in cfg["error"]:
+                lines.append(
+                    f"Fix permissions (chmod 600) | bash=/bin/chmod param1=600 "
+                    f"param2={shlex.quote(CONFIG_PATH)} terminal=false refresh=true"
+                )
+        else:
+            lines.append("Not configured | size=12")
+        lines.append(f"Set up AWS dev boxes… | {sf_icon('gearshape')} {me} param2=--aws-setup terminal=true refresh=true")
+        return "\n".join(lines)
+
+    for w in cfg["warnings"]:
+        lines.append(f"{w} | {sf_icon('exclamationmark.triangle', ORANGE)} color=orange size=12")
+
+    if fetched["auth_error"]:
+        login = " ".join(aws_login_cmd(cfg))
+        lines.append(f"AWS sign-in required | {sf_icon('lock.fill', ORANGE)} color=orange")
+        lines.append(f"--{fetched['error']} | size=12")
+        lines.append(f"--Sign in ({login}) | {me} param2=--aws-login terminal=true refresh=true")
+    elif fetched["error"]:
+        lines.append(f"{fetched['error']} | {sf_icon('exclamationmark.triangle.fill', RED)} color=red")
+    elif not fetched["boxes"] and snap["last_poll"] == 0:
+        lines.append("Loading… | color=gray")
+
+    for box in fetched["boxes"]:
+        icon = box_icon(box)
+        name, state = box.get("name", box["id"]), box.get("state", "unknown")
+        if box.get("missing"):
+            lines.append(f"{name} — not found (check aws.env) | {icon} color=gray")
+            continue
+
+        up = elapsed_time(box.get("launch_time", "")) if state == "running" else ""
+        type_label = f" · {box['type']}" if box.get("type") else ""
+        up_label = f" · up {up}" if up else ""
+        url = console_url(box, cfg)
+        has_public = bool(box.get("public_ip") or box.get("public_dns"))
+        if state == "running" and has_public:
+            click = f"{me} param2=--aws-ssh param3={box['id']} terminal=true"
+        elif state == "running":
+            click = f"{me} param2=--aws-ssm param3={box['id']} terminal=true"
+        else:
+            click = f"href={url}"
+
+        entry = snap["metrics"].get(box["id"])
+        m = entry["m"] if entry else None
+        age = now - entry["at"] if entry else 0
+        summary = f"   {metrics_summary(m)}" if m else ""
+        state_label = "" if state == "running" else f" — {state}"
+        lines.append(f"{name}{state_label}{type_label}{up_label}{summary} | {icon} {click}")
+
+        if m:
+            lines.extend(metrics_lines(m, age))
+            lines.append("-----")
+        elif state == "running" and has_public:
+            err = snap["metrics_err"].get(box["id"])
+            msg = f"Usage unavailable: {err}" if err else "Connecting for usage…"
+            lines.append(f"--{msg} | {sf_icon('antenna.radiowaves.left.and.right', GREY)} color=gray size=11")
+            lines.append("-----")
+
+        lines.append(f"--Instance ID: {box['id']} | font=Menlo size=12")
+        if box.get("type"):
+            lines.append(f"--Type: {box['type']} · {box.get('az', '')} | size=12")
+        if box.get("public_ip"):
+            lines.append(f"--Public IP: {box['public_ip']} | font=Menlo size=12")
+        if box.get("private_ip"):
+            lines.append(f"--Private IP: {box['private_ip']} | font=Menlo size=12")
+        if box.get("status_checks"):
+            lines.append(f"--Status checks: {box['status_checks']} | size=12")
+        if box.get("launch_time"):
+            lines.append(f"--Launched: {box['launch_time']} | size=12")
+        lines.append("-----")
+        if state == "running" and has_public:
+            lines.append(f"--SSH (Terminal) | {sf_icon('terminal')} {me} param2=--aws-ssh param3={box['id']} terminal=true")
+            lines.append(f"--Open htop (Terminal) | {sf_icon('chart.bar.xaxis')} {me} param2=--aws-htop param3={box['id']} terminal=true")
+        if state == "running":
+            lines.append(f"--Connect via SSM (Terminal) | {sf_icon('network')} {me} param2=--aws-ssm param3={box['id']} terminal=true")
+        lines.append(f"--Open in AWS Console | {sf_icon('safari')} href={url}")
+        if box.get("public_ip"):
+            lines.append(
+                f"--Copy Public IP | {sf_icon('doc.on.doc')} bash=/bin/bash param1=-c "
+                f"param2='echo -n {box['public_ip']} | pbcopy' terminal=false"
+            )
+        lines.append(
+            f"--Copy Instance ID | {sf_icon('doc.on.doc')} bash=/bin/bash param1=-c "
+            f"param2='echo -n {box['id']} | pbcopy' terminal=false"
+        )
+        if state == "stopped":
+            lines.append(f"--Start instance | {sf_icon('play.fill', GREEN)} {me} param2=--aws-start param3={box['id']} terminal=false")
+        elif state == "running":
+            lines.append(f"--Stop instance… | {sf_icon('stop.fill', RED)} {me} param2=--aws-stop param3={box['id']} terminal=false")
+
+    lines.append("---")
+    age = now - snap["last_poll"] if snap["last_poll"] else None
+    polled = f"EC2 state polled {age:.0f}s ago · usage every {METRICS_PERIOD:.0f}s" if age is not None else "Polling EC2…"
+    lines.append(f"{polled} | size=11 color=gray")
+    lines.append(f"Edit AWS dev box settings… | {sf_icon('gearshape')} {me} param2=--aws-setup terminal=true refresh=true")
+    lines.append("Refresh now | refresh=true")
+    return "\n".join(lines)
+
+
+def stream_forever() -> None:
+    state = State()
+
+    def poller():
+        while True:
+            try:
+                state.poll_ec2()
+            except Exception as exc:  # keep the stream alive no matter what
+                with state.lock:
+                    state.fetched = {"boxes": [], "error": f"poll failed: {exc}"[:200], "auth_error": False}
+            time.sleep(EC2_POLL_INTERVAL)
+
+    threading.Thread(target=poller, daemon=True, name="ec2-poller").start()
+
+    # First frame right away so the menu bar is not blank while EC2 loads.
+    while True:
+        try:
+            sys.stdout.write("~~~\n")
+            sys.stdout.write(render(state.snapshot()) + "\n")
+            sys.stdout.flush()
+        except BrokenPipeError:
+            return  # SwiftBar went away
+        time.sleep(RENDER_INTERVAL)
+
+
+# --------------------------------------------------------------------------
+# Menu actions (run as a separate short-lived process)
+# --------------------------------------------------------------------------
+
+def notify(message: str, title: str = "AWS Dev Boxes") -> None:
+    message = message.replace('"', '\\"')
+    title = title.replace('"', '\\"')
+    subprocess.run(
+        ["/usr/bin/osascript", "-e", f'display notification "{message}" with title "{title}"'],
+        capture_output=True, timeout=5,
+    )
+
+
+def _confirm_dialog(message: str, button: str) -> bool:
+    message = message.replace('"', '\\"')
+    script = (
+        f'display dialog "{message}" with title "AWS Dev Boxes" '
+        f'buttons {{"Cancel", "{button}"}} default button "Cancel" '
+        f'cancel button "Cancel" with icon caution'
+    )
+    result = subprocess.run(
+        ["/usr/bin/osascript", "-e", script], capture_output=True, text=True, timeout=120
+    )
+    return result.returncode == 0 and button in result.stdout
+
+
+def _find_box(cfg: dict, instance_id: str) -> dict | None:
+    fetched = fetch_dev_boxes({**cfg, "boxes": [instance_id]})
+    if fetched["error"]:
+        notify(fetched["error"])
+        return None
+    for b in fetched["boxes"]:
+        if b.get("id") == instance_id and not b.get("missing"):
+            return b
+    notify(f"Instance {instance_id} not found")
+    return None
+
+
+def action(name: str, instance_id: str) -> None:
+    cfg = load_config()
+    if cfg["error"]:
+        notify(cfg["error"])
+        return
+
+    if name == "--aws-login":
+        cmd = aws_login_cmd(cfg)
+        print(f"$ {' '.join(shlex.quote(c) for c in cmd)}")
+        os.execvp(cmd[0], cmd)
+
+    if not INSTANCE_ID_RE.fullmatch(instance_id):
+        notify(f"Invalid instance ID: {instance_id[:40]}")
+        return
+
+    if name == "--aws-start":
+        code, _, stderr = _run_aws(aws_base_cmd(cfg) + ["ec2", "start-instances", "--instance-ids", instance_id])
+        notify(f"Starting {instance_id}" if code == 0 else f"Start failed: {stderr.strip()[-160:]}")
+    elif name == "--aws-stop":
+        box = _find_box(cfg, instance_id)
+        if not box:
+            return
+        if not _confirm_dialog(
+            f"Stop dev box \"{box['name']}\" ({instance_id})?\n\nAnything running on it will be interrupted.",
+            "Stop",
+        ):
+            return
+        code, _, stderr = _run_aws(aws_base_cmd(cfg) + ["ec2", "stop-instances", "--instance-ids", instance_id])
+        notify(f"Stopping {box['name']}" if code == 0 else f"Stop failed: {stderr.strip()[-160:]}")
+    elif name == "--aws-ssm":
+        cmd = ["aws"]
+        if cfg.get("profile"):
+            cmd += ["--profile", cfg["profile"]]
+        if cfg.get("region"):
+            cmd += ["--region", cfg["region"]]
+        cmd += ["ssm", "start-session", "--target", instance_id]
+        print(f"$ {' '.join(shlex.quote(c) for c in cmd)}")
+        os.execvp(cmd[0], cmd)
+    elif name in ("--aws-ssh", "--aws-htop"):
+        box = _find_box(cfg, instance_id)
+        if not box:
+            return
+        host = box.get("public_dns") or box.get("public_ip")
+        if not host:
+            print(f"{box['name']} has no public address; use SSM instead.")
+            return
+        cmd = ssh_base_cmd(cfg, host, batch=False)
+        if name == "--aws-htop":
+            cmd += ["-t", "command -v htop >/dev/null 2>&1 && exec htop || exec top"]
+        print(f"$ {' '.join(shlex.quote(c) for c in cmd)}")
+        os.execvp(cmd[0], cmd)
+
+
+def setup() -> None:
+    """Interactive setup, run in a Terminal from the menu or by hand."""
+    existing = load_config()
+    print("AWS dev box setup")
+    print("=" * 40)
+    print(
+        "This stores ONLY the profile, region, which instances to show, and the\n"
+        f"SSH user/key path, in  {CONFIG_PATH}  (mode 0600).\n"
+        "No credentials are stored. The plugin uses your AWS CLI sign-in.\n"
+    )
+    if existing["error"]:
+        print(f"Current config problem: {existing['error']}\n")
+
+    default_profile = existing.get("profile") or os.environ.get("AWS_PROFILE") or "default"
+    profile = input(f"AWS profile [{default_profile}]: ").strip() or default_profile
+    if not PROFILE_RE.fullmatch(profile):
+        print("Profile name has unexpected characters; aborting.")
+        return
+    region = input(f"AWS region (blank = profile default) [{existing.get('region') or ''}]: ").strip()
+    region = region or existing.get("region", "")
+    if region and not REGION_RE.fullmatch(region):
+        print("That does not look like an AWS region; aborting.")
+        return
+    cfg = {"profile": "" if profile == "default" else profile, "region": region}
+
+    print("\nLooking up instances you can see…")
+    stdout = ""
+    for attempt in range(2):
+        code, stdout, stderr = _run_aws(aws_base_cmd(cfg) + ["ec2", "describe-instances"])
+        if code == 0:
+            break
+        if _looks_like_auth_error(stderr) and attempt == 0:
+            login = aws_login_cmd(cfg)
+            print(f"Not signed in. Running: {' '.join(login)}")
+            subprocess.run(login)
+            continue
+        print(f"aws failed: {stderr.strip()[-300:]}")
+        return
+
+    instances = []
+    for res in json.loads(stdout or "{}").get("Reservations", []):
+        for inst in res.get("Instances", []):
+            box = _instance_from_json(inst)
+            if box["state"] != "terminated":
+                instances.append(box)
+    instances.sort(key=lambda b: (b["name"].lower(), b["id"]))
+    if instances:
+        print()
+        for i, b in enumerate(instances, 1):
+            print(f"  {i:>3}. {b['name']:<32} {b['id']:<21} {b['state']:<9} {b['type']}")
+        print()
+    else:
+        print("No instances visible with this profile/region.")
+
+    current = ", ".join(existing.get("boxes", []))
+    print("Enter your dev boxes as numbers from the list, instance IDs, or Name tags,")
+    print("separated by commas.")
+    raw = input(f"Dev boxes [{current}]: ").strip() or current
+    boxes = []
+    for item in raw.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if item.isdigit() and 1 <= int(item) <= len(instances):
+            boxes.append(instances[int(item) - 1]["id"])
+        elif INSTANCE_ID_RE.fullmatch(item) or INSTANCE_NAME_RE.fullmatch(item):
+            boxes.append(item)
+        else:
+            print(f"Skipping invalid entry: {item!r}")
+    if not boxes:
+        print("No dev boxes selected; nothing written.")
+        return
+
+    ssh_user = input(f"SSH username (blank = use ~/.ssh/config) [{existing.get('ssh_user') or ''}]: ").strip()
+    ssh_user = ssh_user or existing.get("ssh_user", "")
+    if ssh_user and not SSH_USER_RE.fullmatch(ssh_user):
+        print("SSH username has unexpected characters; leaving blank.")
+        ssh_user = ""
+
+    ssh_key = input(
+        f"SSH private key path, e.g. ~/.ssh/my-key.pem (blank = none) [{existing.get('ssh_key') or ''}]: "
+    ).strip() or existing.get("ssh_key", "")
+    if ssh_key:
+        expanded = os.path.expanduser(ssh_key)
+        problem = "" if os.path.isfile(expanded) else "not found"
+        problem = problem or _secure_file_problem(expanded)
+        if problem:
+            print(f"Key file {problem}. Fix with: chmod 600 {shlex.quote(expanded)}  — leaving blank.")
+            ssh_key = ""
+
+    lines = [
+        "# AWS dev boxes for the SwiftBar monitor. No credentials belong in this file.",
+        "# The plugin signs in via the AWS CLI (aws login / aws sso login).",
+        f"AWS_PROFILE={profile}",
+    ]
+    if region:
+        lines.append(f"AWS_REGION={region}")
+    lines.append(f"BTMON_DEV_BOXES={','.join(boxes)}")
+    if ssh_user:
+        lines.append(f"BTMON_SSH_USER={ssh_user}")
+    if ssh_key:
+        lines.append(f"BTMON_SSH_KEY={ssh_key}")
+
+    os.makedirs(CONFIG_DIR, mode=0o700, exist_ok=True)
+    fd = os.open(CONFIG_PATH, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(lines) + "\n")
+    os.chmod(CONFIG_PATH, 0o600)
+    print(f"\nWrote {CONFIG_PATH}")
+    subprocess.run(["/usr/bin/open", "-g", "swiftbar://refreshplugin?name=devboxes"], capture_output=True)
+
+
+INSTANCE_ACTIONS = {"--aws-start", "--aws-stop", "--aws-ssm", "--aws-ssh", "--aws-htop"}
+
+if __name__ == "__main__":
+    args = sys.argv[1:]
+    if len(args) == 2 and args[0] in INSTANCE_ACTIONS:
+        action(args[0], args[1])
+    elif args == ["--aws-login"]:
+        action("--aws-login", "")
+    elif args == ["--aws-setup"]:
+        setup()
+    elif args == ["--once"]:
+        # Debug helper: one EC2 poll, a few seconds of metrics, one frame.
+        st = State()
+        st.poll_ec2()
+        time.sleep(float(os.environ.get("BTMON_ONCE_WAIT", "5")))
+        print(render(st.snapshot()))
+    else:
+        stream_forever()

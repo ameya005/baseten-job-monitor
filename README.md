@@ -1,13 +1,16 @@
 # Baseten Job Monitor
 
-A macOS menu bar plugin that monitors your [Baseten](https://www.baseten.co/) training jobs and (optionally) your AWS EC2 dev boxes in real time using [SwiftBar](https://github.com/swiftbar/SwiftBar).
+Two macOS menu bar plugins for [SwiftBar](https://github.com/swiftbar/SwiftBar):
+
+- `baseten.1m.py` monitors your [Baseten](https://www.baseten.co/) training jobs, refreshing every minute.
+- `devboxes.py` (optional) is a live monitor for your AWS EC2 dev boxes. It stays running, polls EC2 state once a minute, and streams CPU, RAM, disk, and GPU usage from each box every 2 seconds, like a tiny `htop` in your menu bar.
 
 ## Features
 
 ### Baseten training jobs
 
 - Live job status in your menu bar (refreshes every 1 minute)
-- Color-coded status icons (native SF Symbols): green dot for running, orange dotted circle for starting, red triangle for failed, grey check or stop for completed and stopped
+- Color-coded status icons (native SF Symbols): green play for running, orange hourglass for starting, red stop sign for failed, grey check or stop for completed and stopped
 - GPU count summary across active jobs
 - Launcher and elapsed runtime for each active job
 - Click any job to open it in the Baseten dashboard
@@ -15,11 +18,12 @@ A macOS menu bar plugin that monitors your [Baseten](https://www.baseten.co/) tr
 - Copy job IDs to clipboard
 - Browse all training projects
 
-### AWS dev boxes (optional)
+### AWS dev boxes (optional, `devboxes.py`)
 
-- Menu bar summary of how many of your dev boxes are up, e.g. `BT: idle · EC2: 2/2 up`
-- Per-box state icon (running, pending, stopping, stopped, impaired status checks), instance type, uptime, public and private IP
-- Live usage inside each box's menu, like a tiny `htop`: CPU % with core count and load average, RAM, swap (when in use), disk on `/`, and on GPU boxes each GPU's utilization, VRAM, and temperature from `nvidia-smi`. A compact `CPU 32% · RAM 41% · GPU 87%` summary sits on the box's main line. This is collected over one SSH call per box, in parallel, so a refresh stays at a few seconds.
+- Its own menu bar item with a server icon (green when boxes are up) and a live summary, e.g. `2/2 · CPU 21% · GPU 87%`
+- Per-box state icon: green power for running, orange hourglass for pending, grey moon for stopped, red warning for impaired status checks. Plus instance type, uptime, public and private IP.
+- Live usage inside each box's menu, updated every 2 seconds: CPU % with core count and load average, RAM, swap (when in use), disk on `/`, and on GPU boxes each GPU's utilization, VRAM, and temperature from `nvidia-smi`. A compact `CPU 32% · RAM 41% · GPU 87%` summary sits on the box's main line. Bars turn orange above 70% and red above 90%.
+- Each box keeps one persistent SSH session open for the metrics stream. If the connection drops (laptop sleep, network change) it reconnects by itself, and stale readings are labelled.
 - Clicking a running box opens an SSH session in Terminal (or an SSM session if the box has no public address). Clicking a stopped box opens it in the AWS console.
 - Submenu actions: open `htop` in Terminal, open in the AWS console, connect via SSM or SSH, copy the IP or instance ID, start a stopped box, or stop a running one (with a confirmation dialog)
 - A "Sign in" action appears in the menu when your AWS session has expired
@@ -55,26 +59,27 @@ Make sure `truss` is on your PATH:
 which truss
 ```
 
-### 3. Add the plugin
+### 3. Add the plugins
 
-Clone this repo and symlink (or copy) the plugin into your SwiftBar plugins directory:
+Clone this repo and symlink (or copy) the plugins into your SwiftBar plugins directory. Skip `devboxes.py` if you do not want the AWS monitor.
 
 ```bash
 git clone https://github.com/ameya005/baseten-job-monitor.git
 ln -s "$(pwd)/baseten-job-monitor/baseten.1m.py" ~/swiftbar-plugins/baseten.1m.py
-chmod +x ~/swiftbar-plugins/baseten.1m.py
+ln -s "$(pwd)/baseten-job-monitor/devboxes.py" ~/swiftbar-plugins/devboxes.py
+chmod +x ~/swiftbar-plugins/*.py
 ```
 
 ### 4. Refresh SwiftBar
 
-Click the SwiftBar icon in the menu bar and select **Refresh All**, or restart SwiftBar. You should see **BT: idle** (or your active jobs) appear in the menu bar.
+Click the SwiftBar icon in the menu bar and select **Refresh All**, or restart SwiftBar. You should see **BT: idle** (or your active jobs) appear in the menu bar, and if you added `devboxes.py`, a server icon labelled **EC2**.
 
 ### 5. (Optional) Add your AWS dev boxes
 
-Click the menu bar item, then **AWS Dev Boxes → Set up AWS dev boxes…**. A Terminal window opens, lists the EC2 instances your AWS sign-in can see, and asks you to pick yours. Or run it by hand:
+Click the **EC2** menu bar item, then **Set up AWS dev boxes…**. A Terminal window opens, lists the EC2 instances your AWS sign-in can see, and asks you to pick yours. Or run it by hand:
 
 ```bash
-python3 ~/swiftbar-plugins/baseten.1m.py --aws-setup
+python3 ~/swiftbar-plugins/devboxes.py --aws-setup
 ```
 
 That writes `~/.config/baseten-job-monitor/aws.env` (mode `0600`) that looks like this:
@@ -97,7 +102,7 @@ The plugin is deliberately unable to hold AWS secrets:
 - **No credentials are stored or read by the plugin.** Every AWS call shells out to the `aws` CLI, which uses whatever sign-in you already have: an `aws login` / `aws sso login` session, a named profile, or a `credential_process`. With SSO there are no long-lived keys on disk at all. When the session expires the menu shows a **Sign in** action that runs the right login command for your profile.
 - **The config file only holds non-secret settings** (profile name, region, which instances are yours, SSH username, and the *path* to your SSH key). It is plain `KEY=VALUE` text that the plugin parses itself; it is never `source`d or executed.
 - **The SSH key is never read by the plugin.** Its path is handed to `ssh -i`, and only if the key file is owned by you and not readable by anyone else; otherwise the SSH action falls back to your `~/.ssh/config` and the menu shows a warning.
-- **Usage metrics use the same SSH access you already have.** The plugin pipes a short, fixed shell script (read `/proc/stat`, `free`, `df`, and `nvidia-smi` if present) to `sh` on the box in batch mode, so it never prompts for a password and never runs anything from the config file. If SSH fails, the menu just says usage is unavailable.
+- **Usage metrics use the same SSH access you already have.** The plugin pipes a short, fixed shell script (read `/proc/stat`, `free`, `df`, and `nvidia-smi` if present, in a loop) to `sh` on the box in batch mode, so it never prompts for a password and never runs anything from the config file. If SSH fails, the menu just says usage is unavailable and retries.
 - **The config file is checked before it is read.** If it is not owned by you or is readable by group/others (anything other than mode `0600`), the plugin refuses to load it and offers a one-click fix.
 - **Credential keys are rejected.** If `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`, or `AWS_SECURITY_TOKEN` appear in the file, the plugin refuses to use it and tells you to sign in with the CLI instead. Unknown keys are ignored with a warning.
 - **All input is validated.** Instance IDs, Name tags, profile, region, and SSH user are checked against strict patterns, and every command is run as an argument list with no shell, so nothing in the config can inject commands.
@@ -109,13 +114,15 @@ The plugin only needs read access to EC2 (`ec2:DescribeInstances`, `ec2:Describe
 
 ### Refresh interval
 
-The filename controls the refresh interval — `1m` means every 1 minute. Rename the file to change it:
+For the Baseten plugin, the filename controls the refresh interval — `1m` means every 1 minute. Rename the file to change it:
 
 | Filename | Interval |
 |---|---|
 | `baseten.30s.py` | 30 seconds |
 | `baseten.1m.py` | 1 minute (default) |
 | `baseten.5m.py` | 5 minutes |
+
+The dev box plugin is a SwiftBar "streamable" plugin, so it has no interval in its name. Its timings are constants near the top of `devboxes.py`: `EC2_POLL_INTERVAL` (60 s), `METRICS_PERIOD` (2 s), and `RENDER_INTERVAL` (2 s).
 
 ### PATH resolution
 
