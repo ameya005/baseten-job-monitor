@@ -859,7 +859,7 @@ def _truncate(text: str, n: int) -> str:
 def title_preview(box: dict, m: dict | None) -> str:
     """Menu bar text for one box: SKU, short name, CPU · RAM · VRAM."""
     parts = [box.get("type", ""), _truncate(box.get("name", box["id"]), 12)]
-    text = " ".join(p for p in parts if p)
+    text = " · ".join(p for p in parts if p)
     if m:
         bits = []
         if m.get("cpu_pct") is not None:
