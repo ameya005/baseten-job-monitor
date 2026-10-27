@@ -3,7 +3,7 @@
 One macOS menu bar item for [SwiftBar](https://github.com/swiftbar/SwiftBar) that shows three things in a single dropdown:
 
 - **Baseten** — your [Baseten](https://www.baseten.co/) training jobs, polled every minute.
-- **AWS Dev Boxes** — your EC2 dev boxes, with live CPU, RAM, disk, and GPU usage and a table of what is running on each one, streamed every 2 seconds like a tiny `htop`.
+- **AWS Dev Boxes** — your EC2 dev boxes, with CPU, RAM, disk, and GPU usage and a table of what is running on each one, streamed over SSH every 10 seconds by default (set it to 2 seconds for an `htop`-like live view).
 - **This Mac** — the same usage bars and process table for the machine you are sitting at.
 
 The plugin is `monitor.py`. Click any section header (a box, the Mac, or the Baseten line) to pin it to the menu bar; click it again to unpin and go back to the combined summary.
@@ -33,7 +33,7 @@ The plugin is `monitor.py`. Click any section header (a box, the Mac, or the Bas
 ### AWS dev boxes (optional)
 
 - Per-box state dot (green running, orange pending, grey stopped, red impaired), instance type, uptime, public and private IP.
-- Live usage inside each box's menu, updated every 2 seconds: CPU % with core count and load average, RAM, swap (when in use), disk on `/`, and on GPU boxes each GPU's utilization, VRAM, and temperature from `nvidia-smi`. A compact `CPU 32% · RAM 41% · GPU 87%` summary sits on the box's main line. Rows turn orange above 70% and red above 90%.
+- Usage inside each box's menu, updated every 10 seconds by default (see **Usage refresh** below): CPU % with core count and load average, RAM, swap (when in use), disk on `/`, and on GPU boxes each GPU's utilization, VRAM, and temperature from `nvidia-smi`. A compact `CPU 32% · RAM 41% · GPU 87%` summary sits on the box's main line. Rows turn orange above 70% and red above 90%.
 - A process table under the usage bars shows what is actually running on the box, grouped by project and command rather than by process, e.g. `822% cpu 6.5% mem 18m  10× [ocr-bench-scoring] python -m ocr_bench.cli rescore --datasets …`. The project label comes from the virtualenv or repo directory in the command path. Identical workers collapse into one row with a count, long paths are shortened, and processes running as another user are marked. GPU boxes also list which process holds how much VRAM.
 - Each box keeps one persistent SSH session open for the metrics stream. If the connection drops (laptop sleep, network change) it reconnects by itself, and stale readings are labelled.
 - Clicking a box pins it to the menu bar (clicking the pinned one unpins it). SSH, htop, SSM, and the AWS console are options in the box's submenu.
@@ -45,6 +45,10 @@ The plugin is `monitor.py`. Click any section header (a box, the Mac, or the Bas
 - Computer name and chip, with CPU (from `top`, a real one-second sample), RAM, and disk on the data volume, in the same bar style as the dev boxes. The RAM bar shows **memory pressure** (from `memory_pressure`), not raw used/total, because macOS deliberately keeps "used" near 100% with compressed and cached pages; the used/total figure is still printed next to it.
 - The same grouped process table, so you can see what Cursor, your training scripts, or anything else is doing locally.
 - **Open Activity Monitor** in the submenu.
+
+### Usage refresh
+
+The **Usage refresh** item at the bottom of the dropdown picks how often usage is sampled on the boxes and on the Mac, and how often the menu redraws: every 2, 5, 10, 30, or 60 seconds. The default is 10 seconds, which keeps the load on the boxes low. Pick 2 seconds when you want to watch something closely, and use the **Open htop** action when you need real-time detail. The choice is saved as `BTMON_USAGE_INTERVAL` in the config file.
 
 ## Prerequisites
 
@@ -109,6 +113,7 @@ BTMON_DEV_BOXES=i-0123456789abcdef0,my-box-name   # instance IDs or Name tags
 BTMON_SSH_USER=ubuntu         # optional; blank means rely on ~/.ssh/config
 BTMON_SSH_KEY=~/.ssh/my-key.pem   # optional; passed to `ssh -i`, must be mode 0600
 BTMON_PINNED=i-0123456789abcdef0  # optional; set by "Pin to menu bar". Also accepts "local" (this Mac) or "baseten"
+BTMON_USAGE_INTERVAL=10           # optional; 2, 5, 10, 30, or 60 seconds. Set by "Usage refresh" in the dropdown
 ```
 
 Any of those keys can also be set as environment variables, which take priority over the file.
@@ -132,7 +137,7 @@ The plugin only needs read access to EC2 (`ec2:DescribeInstances`, `ec2:Describe
 
 ### Refresh interval
 
-`monitor.py` is a SwiftBar "streamable" plugin, so it has no interval in its name. Its timings are constants in the file: `TRUSS_POLL_INTERVAL` (60 s), `EC2_POLL_INTERVAL` (60 s), `METRICS_PERIOD` and `LOCAL_POLL_INTERVAL` (2 s), and `RENDER_INTERVAL` (2 s).
+`monitor.py` is a SwiftBar "streamable" plugin, so it has no interval in its name. The usage sampling and redraw interval is chosen from the dropdown (**Usage refresh**, default 10 s). The Baseten and EC2 state polls are constants in the file: `TRUSS_POLL_INTERVAL` and `EC2_POLL_INTERVAL` (both 60 s).
 
 For the Baseten-only plugin, the filename controls the refresh interval — `1m` means every 1 minute. Rename the file to change it:
 

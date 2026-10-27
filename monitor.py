@@ -10,10 +10,11 @@ this Mac, all in one menu bar item.
 This plugin stays running. Three background threads feed one menu:
   * Baseten: `truss train view` once a minute.
   * AWS: EC2 instance state once a minute, plus one SSH session per running
-    box that reports CPU, RAM, disk and GPU usage every ~2 seconds.
-  * Local: `top` / `ps` on this Mac every ~2 seconds.
-The menu redraws every 2 seconds, like a tiny htop. Click any section header
-(a job group, a box, or the Mac) to pin it to the menu bar.
+    box that reports CPU, RAM, disk and GPU usage.
+  * Local: `top` / `ps` on this Mac.
+Usage sampling and the menu redraw share one interval: 10 seconds by default,
+selectable from the dropdown (2 seconds gives an htop-like live view). Click
+any section header (a job group, a box, or the Mac) to pin it to the menu bar.
 
 Security model:
   * The plugin never handles AWS credentials. Every AWS call goes through the
@@ -71,6 +72,7 @@ ALLOWED_KEYS = {
     "BTMON_SSH_USER",
     "BTMON_SSH_KEY",
     "BTMON_PINNED",   # instance ID / Name tag of a box, or "baseten" / "local"
+    "BTMON_USAGE_INTERVAL",  # seconds between usage samples (and menu redraws)
 }
 # Credentials belong to the AWS CLI's own credential chain, never to this file.
 SPECIAL_PINS = {"baseten", "local"}   # non-EC2 things that can sit in the menu bar
@@ -91,9 +93,17 @@ REGION_RE = re.compile(r"[a-z]{2}(-[a-z]+)+-\d")
 
 AWS_TIMEOUT = 25           # seconds for a single aws CLI call
 EC2_POLL_INTERVAL = 60     # seconds between EC2 state polls
-RENDER_INTERVAL = 2.0      # seconds between menu redraws
-METRICS_PERIOD = 2.0       # target seconds between usage samples on the box
-STALE_AFTER = 10           # seconds without a sample before usage is marked stale
+# How often usage (CPU/RAM/GPU/processes) is sampled on each box and on this
+# Mac, and how often the menu redraws. Chosen from the dropdown; stored as
+# BTMON_USAGE_INTERVAL. 10s is a light touch on the boxes; pick 2s when you
+# want an htop-like live view.
+USAGE_INTERVAL_CHOICES = (2, 5, 10, 30, 60)
+DEFAULT_USAGE_INTERVAL = 10
+
+
+def stale_after(interval: int) -> float:
+    """Seconds without a sample before usage is marked stale."""
+    return max(10.0, interval * 2.5)
 SSH_RETRY_DELAY = 6        # seconds before reconnecting a dropped SSH session
 
 
@@ -119,6 +129,7 @@ def load_config() -> dict:
         "ssh_user": "",
         "ssh_key": "",
         "pinned": "",
+        "usage_interval": DEFAULT_USAGE_INTERVAL,
         "configured": False,
         "error": "",
         "warnings": [],
@@ -203,9 +214,19 @@ def load_config() -> dict:
         cfg["warnings"].append("Ignoring BTMON_PINNED: unexpected characters")
         pinned = ""
 
+    usage_interval = DEFAULT_USAGE_INTERVAL
+    raw_interval = values.get("BTMON_USAGE_INTERVAL", "").strip()
+    if raw_interval:
+        if raw_interval.isdigit() and int(raw_interval) in USAGE_INTERVAL_CHOICES:
+            usage_interval = int(raw_interval)
+        else:
+            cfg["warnings"].append(
+                f"Ignoring BTMON_USAGE_INTERVAL={raw_interval[:10]}: use one of {', '.join(map(str, USAGE_INTERVAL_CHOICES))}"
+            )
+
     cfg.update(
         profile=profile, region=region, ssh_user=ssh_user, ssh_key=ssh_key,
-        pinned=pinned, configured=True,
+        pinned=pinned, usage_interval=usage_interval, configured=True,
     )
     return cfg
 
@@ -380,9 +401,9 @@ def fetch_dev_boxes(cfg: dict) -> dict:
 # --------------------------------------------------------------------------
 
 # Fed to `sh` on the box via stdin. Loops forever, printing one frame per
-# METRICS_PERIOD terminated by "@@END". The CPU figure is a real sample over
+# usage interval terminated by "@@END". The CPU figure is a real sample over
 # the sleep window rather than a since-boot average.
-REMOTE_METRICS_LOOP = r"""
+_REMOTE_METRICS_LOOP = r"""
 while :; do
   set -- $(head -1 /proc/stat); u1=$(( $2+$3+$4+$7+$8+$9 )); i1=$(( $5+$6 ))
   sleep %(sleep)s
@@ -400,7 +421,11 @@ while :; do
   ps -eo pid,user:12,pcpu,pmem,etime,args --sort=-pcpu --no-headers 2>/dev/null | head -40 | sed 's/^/PS /'
   echo "@@END"
 done
-""" % {"sleep": f"{METRICS_PERIOD:.1f}"}
+"""
+
+
+def remote_metrics_loop(interval: int) -> str:
+    return _REMOTE_METRICS_LOOP % {"sleep": str(int(interval))}
 
 # Processes that are noise in a "what code is running" view.
 PROC_IGNORE_RE = re.compile(
@@ -664,7 +689,7 @@ class MetricsStream(threading.Thread):
             self.stop_event.set()
             return
         assert self.proc.stdin and self.proc.stdout and self.proc.stderr
-        self.proc.stdin.write(REMOTE_METRICS_LOOP)
+        self.proc.stdin.write(remote_metrics_loop(self.cfg.get("usage_interval", DEFAULT_USAGE_INTERVAL)))
         self.proc.stdin.flush()
         self.proc.stdin.close()  # sh reads the whole script, then runs the loop
 
@@ -700,6 +725,10 @@ class State:
         self.local_ident = local_identity()
         self.local: dict | None = None
         self.local_at = 0.0
+
+    def usage_interval(self) -> int:
+        with self.lock:
+            return int(self.cfg.get("usage_interval", DEFAULT_USAGE_INTERVAL))
 
     def poll_baseten(self) -> None:
         res = fetch_baseten()
@@ -1037,7 +1066,6 @@ def fetch_baseten() -> dict:
 # This Mac
 # --------------------------------------------------------------------------
 
-LOCAL_POLL_INTERVAL = 2.0
 
 
 def _sysctl(name: str) -> str:
@@ -1277,10 +1305,10 @@ def title_preview(box: dict, m: dict | None) -> str:
     return SEP.join(p for p in parts if p)
 
 
-def metrics_lines(m: dict, age: float) -> list[str]:
+def metrics_lines(m: dict, age: float, interval: int = DEFAULT_USAGE_INTERVAL) -> list[str]:
     mono = "font=Menlo size=11"
     out = []
-    stale = f"  (stale {age:.0f}s)" if age > STALE_AFTER else ""
+    stale = f"  (stale {age:.0f}s)" if age > stale_after(interval) else ""
 
     def row(label: str, pct: float | None, detail: str) -> str:
         # Text only; a hot row turns orange/red via the line color.
@@ -1405,7 +1433,7 @@ def _ec2_title(cfg: dict, fetched: dict, snap: dict, now: float) -> tuple[str, s
     cpus, rams, vrams = [], [], []
     for b in running:
         entry = snap["metrics"].get(b["id"])
-        if entry and now - entry["at"] <= STALE_AFTER:
+        if entry and now - entry["at"] <= stale_after(cfg["usage_interval"]):
             m = entry["m"]
             if m.get("cpu_pct") is not None:
                 cpus.append(m["cpu_pct"])
@@ -1435,7 +1463,7 @@ def render_title(snap: dict, now: float) -> str:
         text, color = _bt_title(bt)
         return f"{text} | color={color}" if color else text
     if pinned_key == "local":
-        fresh = snap["local"] if snap["local"] and now - snap["local_at"] <= STALE_AFTER else None
+        fresh = snap["local"] if snap["local"] and now - snap["local_at"] <= stale_after(cfg["usage_interval"]) else None
         return _local_title(snap["local_ident"], fresh)
     pinned = next(
         (b for b in fetched["boxes"] if pinned_key and pinned_key in (b["id"], b.get("name")) and not b.get("missing")),
@@ -1443,7 +1471,7 @@ def render_title(snap: dict, now: float) -> str:
     )
     if pinned:
         entry = snap["metrics"].get(pinned["id"])
-        fresh = entry["m"] if entry and now - entry["at"] <= STALE_AFTER else None
+        fresh = entry["m"] if entry and now - entry["at"] <= stale_after(cfg["usage_interval"]) else None
         if pinned.get("state") != "running":
             return f"{title_preview(pinned, None)}: {pinned.get('state', 'unknown')} | color=gray"
         text = title_preview(pinned, fresh)
@@ -1453,7 +1481,7 @@ def render_title(snap: dict, now: float) -> str:
     bt_text, bt_color = _bt_title(bt)
     ec2_text, ec2_color = _ec2_title(cfg, fetched, snap, now)
     ec2_short = ec2_text.split(SEP)[0] if ec2_text else ""   # just "EC2: 2/2 up"
-    local = snap["local"] if snap["local"] and now - snap["local_at"] <= STALE_AFTER else None
+    local = snap["local"] if snap["local"] and now - snap["local_at"] <= stale_after(cfg["usage_interval"]) else None
     local_short = f"Mac: CPU {local['cpu_pct']}%" if local and local.get("cpu_pct") is not None else ""
     text = SEP.join(t for t in (bt_text, ec2_short, local_short) if t)
     color = bt_color or ec2_color
@@ -1573,7 +1601,7 @@ def render_aws(snap: dict, me: str, now: float) -> list[str]:
         lines.append(f"{name} — {state}{up_label}{type_label}{summary} | {icon} {click}{pin_flag}")
 
         if m:
-            lines.extend(metrics_lines(m, age))
+            lines.extend(metrics_lines(m, age, cfg["usage_interval"]))
             lines.extend(process_lines(m))
             lines.append("-----")
         elif state == "running" and has_public:
@@ -1628,7 +1656,7 @@ def render_local(snap: dict, me: str, now: float) -> list[str]:
     summary = f" · {metrics_summary(m)}" if m else ""
     lines = [f"{ident['name']} — this Mac{chip}{summary} | {sf_icon('circle.fill', GREEN)} {click}{' checked=true' if pinned else ''}"]
     if m:
-        lines.extend(metrics_lines(m, now - snap["local_at"]))
+        lines.extend(metrics_lines(m, now - snap["local_at"], snap["cfg"]["usage_interval"]))
         lines.extend(process_lines(m))
     else:
         lines.append("--Sampling… | color=gray size=11")
@@ -1658,7 +1686,12 @@ def render(snap: dict) -> str:
     lines.append("---")
     bt_age = f"Baseten {now - snap['bt']['at']:.0f}s ago" if snap["bt"]["at"] else "Baseten loading"
     ec2_age = f"EC2 {now - snap['last_poll']:.0f}s ago" if snap["last_poll"] else "EC2 loading"
-    lines.append(f"Polled: {bt_age} · {ec2_age} · usage every {METRICS_PERIOD:.0f}s | size=11 color=gray")
+    interval = snap["cfg"]["usage_interval"]
+    lines.append(f"Polled: {bt_age} · {ec2_age} · usage every {interval}s | size=11 color=gray")
+    lines.append(f"Usage refresh: every {interval}s")
+    for choice in USAGE_INTERVAL_CHOICES:
+        flag = " checked=true" if choice == interval else ""
+        lines.append(f"--Every {choice}s | {me} param2=--aws-usage-interval param3={choice} terminal=false{flag}")
     lines.append(f"Edit AWS dev box settings… | {me} param2=--aws-setup terminal=false refresh=true")
     lines.append("Refresh | refresh=true")
     return "\n".join(lines)
@@ -1693,7 +1726,7 @@ def stream_forever() -> None:
             except Exception:
                 pass
             # `top` itself takes ~1s, so sleep only the remainder of the period.
-            time.sleep(max(0.2, LOCAL_POLL_INTERVAL - (time.time() - started)))
+            time.sleep(max(0.2, state.usage_interval() - (time.time() - started)))
 
     threading.Thread(target=poller, daemon=True, name="ec2-poller").start()
     threading.Thread(target=bt_poller, daemon=True, name="truss-poller").start()
@@ -1707,7 +1740,7 @@ def stream_forever() -> None:
             sys.stdout.flush()
         except BrokenPipeError:
             return  # SwiftBar went away
-        time.sleep(RENDER_INTERVAL)
+        time.sleep(state.usage_interval())
 
 
 # --------------------------------------------------------------------------
@@ -1805,6 +1838,18 @@ def action(name: str, instance_id: str, host: str = "") -> None:
 
     if name == "--aws-login":
         run_interactive(aws_login_cmd(cfg), "AWS sign in")
+        return
+
+    if name == "--aws-usage-interval":
+        if not (instance_id.isdigit() and int(instance_id) in USAGE_INTERVAL_CHOICES):
+            notify(f"Invalid usage interval: {instance_id[:10]}")
+            return
+        err = write_config_key("BTMON_USAGE_INTERVAL", instance_id)
+        if err:
+            notify(err)
+            return
+        # Restart the stream so the new period takes effect everywhere.
+        subprocess.run(["/usr/bin/open", "-g", "swiftbar://refreshplugin?name=monitor"], capture_output=True)
         return
 
     if name in ("--aws-pin", "--aws-unpin"):
@@ -1971,6 +2016,8 @@ def setup() -> None:
         lines.append(f"BTMON_SSH_KEY={ssh_key}")
     if existing.get("pinned"):
         lines.append(f"BTMON_PINNED={existing['pinned']}")
+    if existing.get("usage_interval", DEFAULT_USAGE_INTERVAL) != DEFAULT_USAGE_INTERVAL:
+        lines.append(f"BTMON_USAGE_INTERVAL={existing['usage_interval']}")
 
     os.makedirs(CONFIG_DIR, mode=0o700, exist_ok=True)
     fd = os.open(CONFIG_PATH, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
@@ -1981,7 +2028,7 @@ def setup() -> None:
     subprocess.run(["/usr/bin/open", "-g", "swiftbar://refreshplugin?name=monitor"], capture_output=True)
 
 
-INSTANCE_ACTIONS = {"--aws-start", "--aws-stop", "--aws-ssm", "--aws-ssh", "--aws-htop", "--aws-pin"}
+INSTANCE_ACTIONS = {"--aws-start", "--aws-stop", "--aws-ssm", "--aws-ssh", "--aws-htop", "--aws-pin", "--aws-usage-interval"}
 
 if __name__ == "__main__":
     args = sys.argv[1:]
