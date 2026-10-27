@@ -7,11 +7,7 @@ A macOS menu bar plugin that monitors your [Baseten](https://www.baseten.co/) tr
 ### Baseten training jobs
 
 - Live job status in your menu bar (refreshes every 1 minute)
-- Color-coded status indicators:
-  - 🟢 Running
-  - 🟡 Starting / Created
-  - 🔴 Failed
-  - ⚫ Stopped / Completed
+- Color-coded status icons (native SF Symbols): green dot for running, orange dotted circle for starting, red triangle for failed, grey check or stop for completed and stopped
 - GPU count summary across active jobs
 - Launcher and elapsed runtime for each active job
 - Click any job to open it in the Baseten dashboard
@@ -22,8 +18,10 @@ A macOS menu bar plugin that monitors your [Baseten](https://www.baseten.co/) tr
 ### AWS dev boxes (optional)
 
 - Menu bar summary of how many of your dev boxes are up, e.g. `BT: idle · EC2: 2/2 up`
-- Per-box state (🟢 running, 🟡 pending, 🟠 stopping, ⚫ stopped, 🔴 impaired status checks), instance type, uptime, public and private IP
-- One-click actions: open in the AWS console, connect via SSM or SSH in a Terminal, copy the IP or instance ID, start a stopped box, or stop a running one (with a confirmation dialog)
+- Per-box state icon (running, pending, stopping, stopped, impaired status checks), instance type, uptime, public and private IP
+- Live usage inside each box's menu, like a tiny `htop`: CPU % with core count and load average, RAM, swap (when in use), disk on `/`, and on GPU boxes each GPU's utilization, VRAM, and temperature from `nvidia-smi`. A compact `CPU 32% · RAM 41% · GPU 87%` summary sits on the box's main line. This is collected over one SSH call per box, in parallel, so a refresh stays at a few seconds.
+- Clicking a running box opens an SSH session in Terminal (or an SSM session if the box has no public address). Clicking a stopped box opens it in the AWS console.
+- Submenu actions: open `htop` in Terminal, open in the AWS console, connect via SSM or SSH, copy the IP or instance ID, start a stopped box, or stop a running one (with a confirmation dialog)
 - A "Sign in" action appears in the menu when your AWS session has expired
 
 ## Prerequisites
@@ -99,6 +97,7 @@ The plugin is deliberately unable to hold AWS secrets:
 - **No credentials are stored or read by the plugin.** Every AWS call shells out to the `aws` CLI, which uses whatever sign-in you already have: an `aws login` / `aws sso login` session, a named profile, or a `credential_process`. With SSO there are no long-lived keys on disk at all. When the session expires the menu shows a **Sign in** action that runs the right login command for your profile.
 - **The config file only holds non-secret settings** (profile name, region, which instances are yours, SSH username, and the *path* to your SSH key). It is plain `KEY=VALUE` text that the plugin parses itself; it is never `source`d or executed.
 - **The SSH key is never read by the plugin.** Its path is handed to `ssh -i`, and only if the key file is owned by you and not readable by anyone else; otherwise the SSH action falls back to your `~/.ssh/config` and the menu shows a warning.
+- **Usage metrics use the same SSH access you already have.** The plugin pipes a short, fixed shell script (read `/proc/stat`, `free`, `df`, and `nvidia-smi` if present) to `sh` on the box in batch mode, so it never prompts for a password and never runs anything from the config file. If SSH fails, the menu just says usage is unavailable.
 - **The config file is checked before it is read.** If it is not owned by you or is readable by group/others (anything other than mode `0600`), the plugin refuses to load it and offers a one-click fix.
 - **Credential keys are rejected.** If `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`, or `AWS_SECURITY_TOKEN` appear in the file, the plugin refuses to use it and tells you to sign in with the CLI instead. Unknown keys are ignored with a warning.
 - **All input is validated.** Instance IDs, Name tags, profile, region, and SSH user are checked against strict patterns, and every command is run as an argument list with no shell, so nothing in the config can inject commands.

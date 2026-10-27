@@ -198,17 +198,24 @@ def parse_projects(raw: str) -> list[dict]:
     return projects
 
 
-def status_emoji(status: str) -> str:
+def status_icon(status: str) -> str:
+    """SwiftBar params for a Baseten job status icon (SF Symbol + color)."""
     s = status.upper()
     if "RUNNING" in s:
-        return "🟢"
+        return "sfimage=circle.fill sfcolor=#34c759"
     if "CREATED" in s:
-        return "🟡"
-    if "FAILED" in s or "DEPLOY_FAILED" in s:
-        return "🔴"
-    if "STOPPED" in s or "COMPLETED" in s:
-        return "⚫"
-    return "⚪"
+        return "sfimage=circle.dotted sfcolor=#ff9f0a"
+    if "FAILED" in s:
+        return "sfimage=exclamationmark.triangle.fill sfcolor=#ff453a"
+    if "COMPLETED" in s:
+        return "sfimage=checkmark.circle.fill sfcolor=#8e8e93"
+    if "STOPPED" in s:
+        return "sfimage=stop.circle.fill sfcolor=#8e8e93"
+    return "sfimage=circle sfcolor=#8e8e93"
+
+
+# Backwards-compatible alias for anyone importing the old name.
+status_emoji = status_icon
 
 
 def parse_gpu_info(instance: str) -> str:
@@ -564,10 +571,11 @@ def _instance_from_json(inst: dict) -> dict:
     }
 
 
-def fetch_dev_boxes(cfg: dict) -> dict:
+def fetch_dev_boxes(cfg: dict, with_metrics: bool = True) -> dict:
     """Query EC2 for the configured dev boxes.
 
-    Returns {"boxes": [...], "error": str, "auth_error": bool}.
+    Returns {"boxes": [...], "error": str, "auth_error": bool}. When
+    with_metrics is set, running boxes also get live CPU/RAM/GPU usage via SSH.
     """
     out = {"boxes": [], "error": "", "auth_error": False}
     ids = [b for b in cfg["boxes"] if INSTANCE_ID_RE.fullmatch(b)]
@@ -631,24 +639,232 @@ def fetch_dev_boxes(cfg: dict) -> dict:
                 ordered.append(m)
         if not matches:
             ordered.append({"id": entry, "name": entry, "state": "not found", "missing": True})
+
+    # Live usage over SSH for running boxes, all at once.
+    if with_metrics:
+        targets = [
+            b for b in ordered
+            if b.get("state") == "running" and (b.get("public_dns") or b.get("public_ip"))
+        ]
+        if targets:
+            with ThreadPoolExecutor(max_workers=min(8, len(targets))) as pool:
+                for box, res in zip(targets, pool.map(lambda b: fetch_box_metrics(cfg, b), targets)):
+                    box.update(res)
+
     out["boxes"] = ordered
     return out
 
 
-def ec2_state_emoji(box: dict) -> str:
+# Runs on the box over SSH (fed to `sh` via stdin, so no quoting issues).
+# Prints one metric per line; nvidia-smi lines only appear on GPU boxes.
+REMOTE_METRICS_SCRIPT = r"""
+set -- $(head -1 /proc/stat); u1=$(( $2+$3+$4+$7+$8+$9 )); i1=$(( $5+$6 ))
+sleep 0.6
+set -- $(head -1 /proc/stat); u2=$(( $2+$3+$4+$7+$8+$9 )); i2=$(( $5+$6 ))
+t=$(( (u2-u1)+(i2-i1) )); if [ "$t" -gt 0 ]; then cpu=$(( 100*(u2-u1)/t )); else cpu=0; fi
+echo "CPU $cpu $(nproc 2>/dev/null || echo 0) $(cut -d' ' -f1-3 /proc/loadavg)"
+free -m 2>/dev/null | awk '/^Mem:/{print "MEM",$3,$2} /^Swap:/{print "SWAP",$3,$2}'
+df -Pm / 2>/dev/null | awk 'NR==2{print "DISK",$3,$2}'
+if command -v nvidia-smi >/dev/null 2>&1; then
+  nvidia-smi --query-gpu=index,name,utilization.gpu,memory.used,memory.total,temperature.gpu \
+    --format=csv,noheader,nounits 2>/dev/null | sed 's/^/GPU /'
+fi
+"""
+METRICS_TIMEOUT = 15
+
+# Instance families that normally carry NVIDIA GPUs (used only as a hint for labels).
+GPU_FAMILY_RE = re.compile(r"^(p[2-5]|g[3-6]|gr6|g5g)[a-z]*\.", re.I)
+
+
+def ssh_base_cmd(cfg: dict, host: str, batch: bool = True) -> list[str]:
+    """Build the ssh command line used for both interactive and batch calls."""
+    cmd = ["ssh"]
+    if cfg.get("ssh_key"):
+        cmd += ["-i", cfg["ssh_key"]]
+    if batch:
+        cmd += [
+            "-o", "BatchMode=yes",
+            "-o", "ConnectTimeout=6",
+            "-o", "StrictHostKeyChecking=accept-new",
+            "-o", "LogLevel=ERROR",
+        ]
+    target = f"{cfg['ssh_user']}@{host}" if cfg.get("ssh_user") else host
+    cmd.append(target)
+    return cmd
+
+
+def parse_metrics(raw: str) -> dict:
+    """Turn REMOTE_METRICS_SCRIPT output into a dict."""
+    m: dict = {"gpus": []}
+    for line in raw.splitlines():
+        parts = line.split()
+        if not parts:
+            continue
+        kind = parts[0]
+        try:
+            if kind == "CPU" and len(parts) >= 3:
+                m["cpu_pct"] = int(parts[1])
+                m["cores"] = int(parts[2])
+                m["load"] = " ".join(parts[3:6])
+            elif kind == "MEM" and len(parts) >= 3:
+                m["mem_used_mb"], m["mem_total_mb"] = int(parts[1]), int(parts[2])
+            elif kind == "SWAP" and len(parts) >= 3:
+                m["swap_used_mb"], m["swap_total_mb"] = int(parts[1]), int(parts[2])
+            elif kind == "DISK" and len(parts) >= 3:
+                m["disk_used_mb"], m["disk_total_mb"] = int(parts[1]), int(parts[2])
+            elif kind == "GPU":
+                cells = [c.strip() for c in line[4:].split(",")]
+                if len(cells) >= 5:
+                    m["gpus"].append({
+                        "index": cells[0],
+                        "name": re.sub(r"^NVIDIA\s+", "", cells[1]),
+                        "util_pct": int(cells[2]) if cells[2].isdigit() else None,
+                        "vram_used_mb": int(cells[3]) if cells[3].isdigit() else None,
+                        "vram_total_mb": int(cells[4]) if cells[4].isdigit() else None,
+                        "temp_c": int(cells[5]) if len(cells) > 5 and cells[5].isdigit() else None,
+                    })
+        except ValueError:
+            continue
+    return m
+
+
+def fetch_box_metrics(cfg: dict, box: dict) -> dict:
+    """SSH into a running box and collect CPU/RAM/disk/GPU usage.
+
+    Returns {"metrics": {...}} or {"metrics_error": str}.
+    """
+    host = box.get("public_dns") or box.get("public_ip")
+    if not host:
+        return {"metrics_error": "no public address for SSH"}
+    cmd = ssh_base_cmd(cfg, host) + ["sh"]
+    try:
+        result = subprocess.run(
+            cmd, input=REMOTE_METRICS_SCRIPT, capture_output=True, text=True,
+            timeout=METRICS_TIMEOUT,
+        )
+    except FileNotFoundError:
+        return {"metrics_error": "ssh not found"}
+    except subprocess.TimeoutExpired:
+        return {"metrics_error": f"ssh timed out after {METRICS_TIMEOUT}s"}
+    if result.returncode != 0:
+        err = result.stderr.strip().splitlines()
+        return {"metrics_error": (err[-1] if err else f"ssh exited {result.returncode}")[:120]}
+    metrics = parse_metrics(result.stdout)
+    if "cpu_pct" not in metrics and "mem_total_mb" not in metrics:
+        return {"metrics_error": "no metrics returned"}
+    return {"metrics": metrics}
+
+
+def usage_bar(pct: float | None, width: int = 10) -> str:
+    if pct is None:
+        return "░" * width
+    filled = max(0, min(width, round(pct / 100 * width)))
+    return "█" * filled + "░" * (width - filled)
+
+
+def _gb(mb: int | None) -> str:
+    return "?" if mb is None else f"{mb / 1024:.0f}" if mb >= 10240 else f"{mb / 1024:.1f}"
+
+
+def _pct(used: int | None, total: int | None) -> float | None:
+    if used is None or not total:
+        return None
+    return 100.0 * used / total
+
+
+def _usage_color(pct: float | None) -> str:
+    if pct is None:
+        return "#8e8e93"
+    if pct >= 90:
+        return "#ff453a"
+    if pct >= 70:
+        return "#ff9f0a"
+    return "#34c759"
+
+
+def metrics_summary(metrics: dict) -> str:
+    """Compact 'CPU 32% · RAM 41% · GPU 87%' for the box's main line."""
+    bits = []
+    if metrics.get("cpu_pct") is not None:
+        bits.append(f"CPU {metrics['cpu_pct']}%")
+    mem = _pct(metrics.get("mem_used_mb"), metrics.get("mem_total_mb"))
+    if mem is not None:
+        bits.append(f"RAM {mem:.0f}%")
+    utils = [g["util_pct"] for g in metrics.get("gpus", []) if g.get("util_pct") is not None]
+    if utils:
+        bits.append(f"GPU {max(utils)}%")
+    return " · ".join(bits)
+
+
+def print_metrics_lines(metrics: dict) -> None:
+    """Submenu lines (prefixed with --) that read like a tiny htop."""
+    mono = "font=Menlo size=11"
+
+    cpu = metrics.get("cpu_pct")
+    cores = metrics.get("cores") or 0
+    load = metrics.get("load", "")
+    cores_label = f"{cores} cores" if cores else ""
+    load_label = f"load {load}" if load else ""
+    tail = " · ".join(x for x in (cores_label, load_label) if x)
+    print(
+        f"--CPU  {usage_bar(cpu)} {cpu if cpu is not None else '?':>3}%  {tail} "
+        f"| {mono} sfimage=cpu sfcolor={_usage_color(cpu)}"
+    )
+
+    mem = _pct(metrics.get("mem_used_mb"), metrics.get("mem_total_mb"))
+    if mem is not None:
+        print(
+            f"--RAM  {usage_bar(mem)} {mem:>3.0f}%  "
+            f"{_gb(metrics['mem_used_mb'])}/{_gb(metrics['mem_total_mb'])} GB "
+            f"| {mono} sfimage=memorychip sfcolor={_usage_color(mem)}"
+        )
+    swap = _pct(metrics.get("swap_used_mb"), metrics.get("swap_total_mb"))
+    if swap is not None and metrics.get("swap_used_mb", 0) > 0:
+        print(
+            f"--Swap {usage_bar(swap)} {swap:>3.0f}%  "
+            f"{_gb(metrics['swap_used_mb'])}/{_gb(metrics['swap_total_mb'])} GB "
+            f"| {mono} sfimage=memorychip sfcolor={_usage_color(swap)}"
+        )
+
+    for g in metrics.get("gpus", []):
+        util = g.get("util_pct")
+        vram = _pct(g.get("vram_used_mb"), g.get("vram_total_mb"))
+        temp = f" · {g['temp_c']}°C" if g.get("temp_c") is not None else ""
+        label = f"GPU{g['index']}" if len(metrics["gpus"]) > 1 else "GPU "
+        print(
+            f"--{label} {usage_bar(util)} {util if util is not None else '?':>3}%  "
+            f"{g['name']}{temp} | {mono} sfimage=rectangle.3.group sfcolor={_usage_color(util)}"
+        )
+        print(
+            f"--VRAM {usage_bar(vram)} {vram if vram is not None else 0:>3.0f}%  "
+            f"{_gb(g['vram_used_mb'])}/{_gb(g['vram_total_mb'])} GB "
+            f"| {mono} sfimage=memorychip.fill sfcolor={_usage_color(vram)}"
+        )
+
+    disk = _pct(metrics.get("disk_used_mb"), metrics.get("disk_total_mb"))
+    if disk is not None:
+        print(
+            f"--Disk {usage_bar(disk)} {disk:>3.0f}%  "
+            f"{_gb(metrics['disk_used_mb'])}/{_gb(metrics['disk_total_mb'])} GB on / "
+            f"| {mono} sfimage=internaldrive sfcolor={_usage_color(disk)}"
+        )
+
+
+def ec2_state_icon(box: dict) -> str:
+    """SwiftBar params for an EC2 state icon (SF Symbol + color)."""
     if box.get("missing"):
-        return "❓"
+        return "sfimage=questionmark.circle sfcolor=#8e8e93"
     if box.get("impaired"):
-        return "🔴"
+        return "sfimage=exclamationmark.triangle.fill sfcolor=#ff453a"
     state = box.get("state", "")
     return {
-        "running": "🟢",
-        "pending": "🟡",
-        "stopping": "🟠",
-        "shutting-down": "🟠",
-        "stopped": "⚫",
-        "terminated": "🔴",
-    }.get(state, "⚪")
+        "running": "sfimage=circle.fill sfcolor=#34c759",
+        "pending": "sfimage=circle.dotted sfcolor=#ff9f0a",
+        "stopping": "sfimage=circle.lefthalf.filled sfcolor=#ff9f0a",
+        "shutting-down": "sfimage=circle.lefthalf.filled sfcolor=#ff9f0a",
+        "stopped": "sfimage=stop.circle.fill sfcolor=#8e8e93",
+        "terminated": "sfimage=xmark.circle.fill sfcolor=#ff453a",
+    }.get(state, "sfimage=circle sfcolor=#8e8e93")
 
 
 def ec2_console_url(box: dict, cfg: dict) -> str:
@@ -689,7 +905,7 @@ def print_aws_section(cfg: dict, fetched: dict) -> None:
     if not cfg["configured"]:
         print(header)
         if cfg["error"]:
-            print(f"--⚠️ {cfg['error']} | color=red size=12")
+            print(f"--{cfg['error']} | sfimage=exclamationmark.triangle.fill sfcolor=#ff453a color=red size=12")
             if "permissions" in cfg["error"]:
                 print(
                     f"--Fix permissions (chmod 600) | bash=/bin/chmod param1=600 "
@@ -705,11 +921,11 @@ def print_aws_section(cfg: dict, fetched: dict) -> None:
 
     print(header)
     for w in cfg["warnings"]:
-        print(f"--⚠️ {w} | color=orange size=12")
+        print(f"--{w} | sfimage=exclamationmark.triangle sfcolor=#ff9f0a color=orange size=12")
 
     if fetched["auth_error"]:
         login = " ".join(aws_login_cmd(cfg))
-        print(f"🔐 AWS sign-in required | color=orange")
+        print("AWS sign-in required | sfimage=lock.fill sfcolor=#ff9f0a color=orange")
         print(f"--{fetched['error']} | size=12")
         print(
             f"--Sign in ({login}) | bash={python} param1={script} "
@@ -717,25 +933,49 @@ def print_aws_section(cfg: dict, fetched: dict) -> None:
         )
         return
     if fetched["error"]:
-        print(f"⚠️ {fetched['error']} | color=red")
+        print(f"{fetched['error']} | sfimage=exclamationmark.triangle.fill sfcolor=#ff453a color=red")
         return
 
     for box in fetched["boxes"]:
-        emoji = ec2_state_emoji(box)
+        icon = ec2_state_icon(box)
         name = box.get("name", box["id"])
         state = box.get("state", "unknown")
         if box.get("missing"):
-            print(f"{emoji} {name} — not found (check aws.env) | color=gray")
+            print(f"{name} — not found (check aws.env) | {icon} color=gray")
             continue
 
         up = elapsed_time(box.get("launch_time", "")) if state == "running" else ""
         up_label = f" · up {up}" if up else ""
         type_label = f" [{box['type']}]" if box.get("type") else ""
         url = ec2_console_url(box, cfg)
-        print(f"{emoji} {name} — {state}{up_label}{type_label} | href={url}")
+
+        # Clicking a box connects to it: SSH when it has a public address,
+        # SSM otherwise. Stopped boxes open the console instead.
+        has_public = bool(box.get("public_ip") or box.get("public_dns"))
+        if state == "running" and has_public:
+            click = f"bash={python} param1={script} param2=--aws-ssh param3={box['id']} terminal=true"
+        elif state == "running":
+            click = f"bash={python} param1={script} param2=--aws-ssm param3={box['id']} terminal=true"
+        else:
+            click = f"href={url}"
+        metrics = box.get("metrics")
+        summary = f" · {metrics_summary(metrics)}" if metrics else ""
+        print(f"{name} — {state}{up_label}{type_label}{summary} | {icon} {click}")
+
+        if metrics:
+            print_metrics_lines(metrics)
+            print("-----")
+        elif box.get("metrics_error") and state == "running":
+            print(
+                f"--Usage unavailable: {box['metrics_error']} "
+                f"| sfimage=exclamationmark.triangle sfcolor=#8e8e93 color=gray size=11"
+            )
+            print("-----")
+
+        gpu_hint = " · GPU instance" if GPU_FAMILY_RE.match(box.get("type", "")) and not (metrics or {}).get("gpus") else ""
         print(f"--Instance ID: {box['id']} | font=monospace size=12")
         if box.get("type"):
-            print(f"--Type: {box['type']} · {box.get('az', '')} | size=12")
+            print(f"--Type: {box['type']} · {box.get('az', '')}{gpu_hint} | size=12")
         if box.get("public_ip"):
             print(f"--Public IP: {box['public_ip']} | font=monospace size=12")
         if box.get("private_ip"):
@@ -753,8 +993,12 @@ def print_aws_section(cfg: dict, fetched: dict) -> None:
             )
             if box.get("public_ip") or box.get("public_dns"):
                 print(
-                    f"--SSH (Terminal) | bash={python} param1={script} "
+                    f"--SSH (Terminal) | sfimage=terminal bash={python} param1={script} "
                     f"param2=--aws-ssh param3={box['id']} terminal=true"
+                )
+                print(
+                    f"--Open htop (Terminal) | sfimage=gauge.with.dots.needle.67percent bash={python} param1={script} "
+                    f"param2=--aws-htop param3={box['id']} terminal=true"
                 )
         if box.get("public_ip"):
             print(
@@ -767,12 +1011,12 @@ def print_aws_section(cfg: dict, fetched: dict) -> None:
         )
         if state == "stopped":
             print(
-                f"--▶ Start instance | bash={python} param1={script} "
+                f"--Start instance | sfimage=play.fill bash={python} param1={script} "
                 f"param2=--aws-start param3={box['id']} terminal=false refresh=true"
             )
         elif state == "running":
             print(
-                f"--■ Stop instance… | bash={python} param1={script} "
+                f"--Stop instance… | sfimage=stop.fill bash={python} param1={script} "
                 f"param2=--aws-stop param3={box['id']} terminal=false refresh=true"
             )
 
@@ -800,7 +1044,7 @@ def _find_box(cfg: dict, instance_id: str) -> dict | None:
     if not INSTANCE_ID_RE.fullmatch(instance_id):
         notify(f"Invalid instance ID: {instance_id[:40]}")
         return None
-    fetched = fetch_dev_boxes({**cfg, "boxes": [instance_id]})
+    fetched = fetch_dev_boxes({**cfg, "boxes": [instance_id]}, with_metrics=False)
     if fetched["error"]:
         notify(fetched["error"], "AWS Dev Boxes")
         return None
@@ -862,7 +1106,7 @@ def aws_action(action: str, instance_id: str) -> None:
         cmd += ["ssm", "start-session", "--target", instance_id]
         print(f"$ {' '.join(shlex.quote(c) for c in cmd)}")
         os.execvp(cmd[0], cmd)
-    elif action == "--aws-ssh":
+    elif action in ("--aws-ssh", "--aws-htop"):
         box = _find_box(cfg, instance_id)
         if not box:
             return
@@ -870,11 +1114,10 @@ def aws_action(action: str, instance_id: str) -> None:
         if not host:
             print(f"{box['name']} has no public address; use SSM instead.")
             return
-        target = f"{cfg['ssh_user']}@{host}" if cfg.get("ssh_user") else host
-        cmd = ["ssh"]
-        if cfg.get("ssh_key"):
-            cmd += ["-i", cfg["ssh_key"]]
-        cmd.append(target)
+        cmd = ssh_base_cmd(cfg, host, batch=False)
+        if action == "--aws-htop":
+            # -t allocates a TTY so htop can draw; fall back to top if missing.
+            cmd += ["-t", "command -v htop >/dev/null 2>&1 && exec htop || exec top"]
         print(f"$ {' '.join(shlex.quote(c) for c in cmd)}")
         os.execvp(cmd[0], cmd)
 
@@ -1093,7 +1336,7 @@ def main():
         created_by = job.get("Created By", "")
         created_at = job.get("Created", "")
         elapsed = elapsed_time(created_at)
-        emoji = status_emoji(status)
+        icon = status_icon(status)
         short = short_status(status)
 
         url = f"https://app.baseten.co/training/{project_id}/logs/{job_id}"
@@ -1101,7 +1344,7 @@ def main():
         gpu = parse_gpu_info(instance)
         gpu_label = f" [{gpu}]" if gpu else ""
         elapsed_label = f" · {elapsed}" if elapsed else ""
-        print(f"{emoji} {job_name} — {short}{elapsed_label}{gpu_label} | href={url}")
+        print(f"{job_name} — {short}{elapsed_label}{gpu_label} | {icon} href={url}")
         print(f"--Job ID: {job_id} | font=monospace size=12")
         print(f"--Instance: {instance} | size=12")
         if created_by:
@@ -1134,7 +1377,7 @@ def main():
     print("Refresh | refresh=true")
 
 
-AWS_INSTANCE_ACTIONS = {"--aws-start", "--aws-stop", "--aws-ssm", "--aws-ssh"}
+AWS_INSTANCE_ACTIONS = {"--aws-start", "--aws-stop", "--aws-ssm", "--aws-ssh", "--aws-htop"}
 
 if __name__ == "__main__":
     args = sys.argv[1:]
