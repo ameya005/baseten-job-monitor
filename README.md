@@ -87,6 +87,7 @@ AWS_PROFILE=default
 AWS_REGION=us-east-2          # optional; defaults to the profile's region
 BTMON_DEV_BOXES=i-0123456789abcdef0,my-box-name   # instance IDs or Name tags
 BTMON_SSH_USER=ubuntu         # optional; blank means rely on ~/.ssh/config
+BTMON_SSH_KEY=~/.ssh/my-key.pem   # optional; passed to `ssh -i`, must be mode 0600
 ```
 
 Any of those keys can also be set as environment variables, which take priority over the file.
@@ -96,7 +97,8 @@ Any of those keys can also be set as environment variables, which take priority 
 The plugin is deliberately unable to hold AWS secrets:
 
 - **No credentials are stored or read by the plugin.** Every AWS call shells out to the `aws` CLI, which uses whatever sign-in you already have: an `aws login` / `aws sso login` session, a named profile, or a `credential_process`. With SSO there are no long-lived keys on disk at all. When the session expires the menu shows a **Sign in** action that runs the right login command for your profile.
-- **The config file only holds non-secret settings** (profile name, region, which instances are yours, SSH username). It is plain `KEY=VALUE` text that the plugin parses itself; it is never `source`d or executed.
+- **The config file only holds non-secret settings** (profile name, region, which instances are yours, SSH username, and the *path* to your SSH key). It is plain `KEY=VALUE` text that the plugin parses itself; it is never `source`d or executed.
+- **The SSH key is never read by the plugin.** Its path is handed to `ssh -i`, and only if the key file is owned by you and not readable by anyone else; otherwise the SSH action falls back to your `~/.ssh/config` and the menu shows a warning.
 - **The config file is checked before it is read.** If it is not owned by you or is readable by group/others (anything other than mode `0600`), the plugin refuses to load it and offers a one-click fix.
 - **Credential keys are rejected.** If `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`, or `AWS_SECURITY_TOKEN` appear in the file, the plugin refuses to use it and tells you to sign in with the CLI instead. Unknown keys are ignored with a warning.
 - **All input is validated.** Instance IDs, Name tags, profile, region, and SSH user are checked against strict patterns, and every command is run as an argument list with no shell, so nothing in the config can inject commands.

@@ -344,7 +344,13 @@ AWS_CONFIG_DIR = os.path.expanduser("~/.config/baseten-job-monitor")
 AWS_CONFIG_PATH = os.path.join(AWS_CONFIG_DIR, "aws.env")
 
 # Keys the config file is allowed to set. Anything else is ignored.
-AWS_ALLOWED_KEYS = {"AWS_PROFILE", "AWS_REGION", "BTMON_DEV_BOXES", "BTMON_SSH_USER"}
+AWS_ALLOWED_KEYS = {
+    "AWS_PROFILE",
+    "AWS_REGION",
+    "BTMON_DEV_BOXES",
+    "BTMON_SSH_USER",
+    "BTMON_SSH_KEY",
+}
 # Keys that must never appear in the config file: credentials belong to the
 # AWS CLI's own credential chain, not to this plugin.
 AWS_FORBIDDEN_KEYS = {
@@ -385,6 +391,7 @@ def load_aws_config() -> dict:
         "region": "",
         "boxes": [],
         "ssh_user": "",
+        "ssh_key": "",
         "configured": False,
         "error": "",
         "warnings": [],
@@ -455,7 +462,22 @@ def load_aws_config() -> dict:
         cfg["warnings"].append("Ignoring BTMON_SSH_USER: unexpected characters")
         ssh_user = ""
 
-    cfg.update(profile=profile, region=region, ssh_user=ssh_user, configured=True)
+    # The SSH private key is only ever passed to `ssh -i`; the plugin never
+    # reads it. We do insist that it is private to the user.
+    ssh_key = os.path.expanduser(values.get("BTMON_SSH_KEY", "").strip())
+    if ssh_key:
+        if not os.path.isfile(ssh_key):
+            cfg["warnings"].append(f"BTMON_SSH_KEY not found: {ssh_key}")
+            ssh_key = ""
+        else:
+            problem = _secure_file_problem(ssh_key)
+            if problem:
+                cfg["warnings"].append(f"SSH key {problem}; run chmod 600 on it")
+                ssh_key = ""
+
+    cfg.update(
+        profile=profile, region=region, ssh_user=ssh_user, ssh_key=ssh_key, configured=True
+    )
     return cfg
 
 
@@ -847,8 +869,12 @@ def aws_action(action: str, instance_id: str) -> None:
             print(f"{box['name']} has no public address; use SSM instead.")
             return
         target = f"{cfg['ssh_user']}@{host}" if cfg.get("ssh_user") else host
-        print(f"$ ssh {target}")
-        os.execvp("ssh", ["ssh", target])
+        cmd = ["ssh"]
+        if cfg.get("ssh_key"):
+            cmd += ["-i", cfg["ssh_key"]]
+        cmd.append(target)
+        print(f"$ {' '.join(shlex.quote(c) for c in cmd)}")
+        os.execvp(cmd[0], cmd)
 
 
 def aws_setup() -> None:
@@ -931,6 +957,20 @@ def aws_setup() -> None:
         print("SSH username has unexpected characters; leaving blank.")
         ssh_user = ""
 
+    ssh_key = input(
+        f"SSH private key path, e.g. ~/.ssh/my-key.pem (blank = none) [{existing.get('ssh_key') or ''}]: "
+    ).strip()
+    ssh_key = ssh_key or existing.get("ssh_key", "")
+    if ssh_key:
+        expanded = os.path.expanduser(ssh_key)
+        if not os.path.isfile(expanded):
+            print(f"Key file not found: {expanded}; leaving blank.")
+            ssh_key = ""
+        elif _secure_file_problem(expanded):
+            print(f"Key file {_secure_file_problem(expanded)}. Fix with: chmod 600 {shlex.quote(expanded)}")
+            print("Leaving blank for now.")
+            ssh_key = ""
+
     lines = [
         "# Baseten Monitor — AWS dev boxes. No credentials belong in this file.",
         "# The plugin signs in via the AWS CLI (aws login / aws sso login).",
@@ -941,6 +981,8 @@ def aws_setup() -> None:
     lines.append(f"BTMON_DEV_BOXES={','.join(boxes)}")
     if ssh_user:
         lines.append(f"BTMON_SSH_USER={ssh_user}")
+    if ssh_key:
+        lines.append(f"BTMON_SSH_KEY={ssh_key}")
 
     os.makedirs(AWS_CONFIG_DIR, mode=0o700, exist_ok=True)
     fd = os.open(AWS_CONFIG_PATH, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
