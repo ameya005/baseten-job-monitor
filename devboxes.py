@@ -77,6 +77,7 @@ FORBIDDEN_KEYS = {
 INSTANCE_ID_RE = re.compile(r"i-[0-9a-f]{8,17}")
 INSTANCE_NAME_RE = re.compile(r"[A-Za-z0-9._\-]{1,128}")
 SSH_USER_RE = re.compile(r"[A-Za-z0-9._\-]{1,32}")
+HOST_RE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9.\-]{0,252}[A-Za-z0-9])?")
 PROFILE_RE = re.compile(r"[A-Za-z0-9._\-]{1,64}")
 REGION_RE = re.compile(r"[a-z]{2}(-[a-z]+)+-\d")
 
@@ -736,7 +737,7 @@ def render(snap: dict) -> str:
                 )
         else:
             lines.append("Not configured | size=12")
-        lines.append(f"Set up AWS dev boxes… | {sf_icon('gearshape')} {me} param2=--aws-setup terminal=true refresh=true")
+        lines.append(f"Set up AWS dev boxes… | {sf_icon('gearshape')} {me} param2=--aws-setup terminal=false refresh=true")
         return "\n".join(lines)
 
     for w in cfg["warnings"]:
@@ -746,7 +747,7 @@ def render(snap: dict) -> str:
         login = " ".join(aws_login_cmd(cfg))
         lines.append(f"AWS sign-in required | {sf_icon('lock.fill', ORANGE)} color=orange")
         lines.append(f"--{fetched['error']} | size=12")
-        lines.append(f"--Sign in ({login}) | {me} param2=--aws-login terminal=true refresh=true")
+        lines.append(f"--Sign in ({login}) | {me} param2=--aws-login terminal=false refresh=true")
     elif fetched["error"]:
         lines.append(f"{fetched['error']} | {sf_icon('exclamationmark.triangle.fill', RED)} color=red")
     elif not fetched["boxes"] and snap["last_poll"] == 0:
@@ -763,11 +764,12 @@ def render(snap: dict) -> str:
         type_label = f" · {box['type']}" if box.get("type") else ""
         up_label = f" · up {up}" if up else ""
         url = console_url(box, cfg)
-        has_public = bool(box.get("public_ip") or box.get("public_dns"))
+        host = box.get("public_dns") or box.get("public_ip") or ""
+        has_public = bool(host)
         if state == "running" and has_public:
-            click = f"{me} param2=--aws-ssh param3={box['id']} terminal=true"
+            click = f"{me} param2=--aws-ssh param3={box['id']} param4={host} terminal=false"
         elif state == "running":
-            click = f"{me} param2=--aws-ssm param3={box['id']} terminal=true"
+            click = f"{me} param2=--aws-ssm param3={box['id']} terminal=false"
         else:
             click = f"href={url}"
 
@@ -800,10 +802,10 @@ def render(snap: dict) -> str:
             lines.append(f"--Launched: {box['launch_time']} | size=12")
         lines.append("-----")
         if state == "running" and has_public:
-            lines.append(f"--SSH (Terminal) | {sf_icon('terminal')} {me} param2=--aws-ssh param3={box['id']} terminal=true")
-            lines.append(f"--Open htop (Terminal) | {sf_icon('chart.bar.xaxis')} {me} param2=--aws-htop param3={box['id']} terminal=true")
+            lines.append(f"--SSH (Terminal) | {sf_icon('terminal')} {me} param2=--aws-ssh param3={box['id']} param4={host} terminal=false")
+            lines.append(f"--Open htop (Terminal) | {sf_icon('chart.bar.xaxis')} {me} param2=--aws-htop param3={box['id']} param4={host} terminal=false")
         if state == "running":
-            lines.append(f"--Connect via SSM (Terminal) | {sf_icon('network')} {me} param2=--aws-ssm param3={box['id']} terminal=true")
+            lines.append(f"--Connect via SSM (Terminal) | {sf_icon('network')} {me} param2=--aws-ssm param3={box['id']} terminal=false")
         lines.append(f"--Open in AWS Console | {sf_icon('safari')} href={url}")
         if box.get("public_ip"):
             lines.append(
@@ -823,7 +825,7 @@ def render(snap: dict) -> str:
     age = now - snap["last_poll"] if snap["last_poll"] else None
     polled = f"EC2 state polled {age:.0f}s ago · usage every {METRICS_PERIOD:.0f}s" if age is not None else "Polling EC2…"
     lines.append(f"{polled} | size=11 color=gray")
-    lines.append(f"Edit AWS dev box settings… | {sf_icon('gearshape')} {me} param2=--aws-setup terminal=true refresh=true")
+    lines.append(f"Edit AWS dev box settings… | {sf_icon('gearshape')} {me} param2=--aws-setup terminal=false refresh=true")
     lines.append("Refresh now | refresh=true")
     return "\n".join(lines)
 
@@ -856,6 +858,55 @@ def stream_forever() -> None:
 # --------------------------------------------------------------------------
 # Menu actions (run as a separate short-lived process)
 # --------------------------------------------------------------------------
+
+LAUNCH_DIR = os.path.expanduser("~/Library/Application Support/baseten-job-monitor/launch")
+
+
+def _terminal_app() -> str:
+    """Honor SwiftBar's terminal preference (Terminal or iTerm); default Terminal."""
+    try:
+        out = subprocess.run(
+            ["/usr/bin/defaults", "read", "com.ameba.SwiftBar", "Terminal"],
+            capture_output=True, text=True, timeout=3,
+        ).stdout.strip().lower()
+    except (OSError, subprocess.TimeoutExpired):
+        out = ""
+    return "iTerm" if "iterm" in out else "Terminal"
+
+
+def open_in_terminal(cmd: list[str], title: str) -> None:
+    """Open a new terminal window running `cmd`.
+
+    SwiftBar's own `terminal=false` drives Terminal through AppleScript and
+    System Events, which needs Automation + Accessibility permissions and
+    fails silently without them. Writing a .command file and handing it to
+    `open` needs no permissions and always gets a fresh window.
+    """
+    os.makedirs(LAUNCH_DIR, mode=0o700, exist_ok=True)
+    os.chmod(LAUNCH_DIR, 0o700)
+    safe_title = re.sub(r"[^A-Za-z0-9._ \-]", "", title)[:60]
+    path = os.path.join(LAUNCH_DIR, f"{re.sub(r'[^A-Za-z0-9_-]', '-', title)[:40]}-{os.getpid()}.command")
+    quoted = " ".join(shlex.quote(c) for c in cmd)
+    body = (
+        "#!/bin/sh\n"
+        'rm -f "$0"\n'  # one-shot launcher; the shell already has it open
+        f"printf '\\033]0;%s\\007' {shlex.quote(safe_title)}\n"
+        f"echo {shlex.quote('$ ' + quoted)}\n"
+        f"exec {quoted}\n"
+    )
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o700)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(body)
+    subprocess.run(["/usr/bin/open", "-a", _terminal_app(), path], capture_output=True, timeout=10)
+
+
+def run_interactive(cmd: list[str], title: str) -> None:
+    """Run `cmd` in the current terminal if we have one, else open a new one."""
+    if sys.stdin.isatty():
+        print(f"$ {' '.join(shlex.quote(c) for c in cmd)}")
+        os.execvp(cmd[0], cmd)
+    open_in_terminal(cmd, title)
+
 
 def notify(message: str, title: str = "AWS Dev Boxes") -> None:
     message = message.replace('"', '\\"')
@@ -891,16 +942,15 @@ def _find_box(cfg: dict, instance_id: str) -> dict | None:
     return None
 
 
-def action(name: str, instance_id: str) -> None:
+def action(name: str, instance_id: str, host: str = "") -> None:
     cfg = load_config()
     if cfg["error"]:
         notify(cfg["error"])
         return
 
     if name == "--aws-login":
-        cmd = aws_login_cmd(cfg)
-        print(f"$ {' '.join(shlex.quote(c) for c in cmd)}")
-        os.execvp(cmd[0], cmd)
+        run_interactive(aws_login_cmd(cfg), "AWS sign in")
+        return
 
     if not INSTANCE_ID_RE.fullmatch(instance_id):
         notify(f"Invalid instance ID: {instance_id[:40]}")
@@ -927,21 +977,27 @@ def action(name: str, instance_id: str) -> None:
         if cfg.get("region"):
             cmd += ["--region", cfg["region"]]
         cmd += ["ssm", "start-session", "--target", instance_id]
-        print(f"$ {' '.join(shlex.quote(c) for c in cmd)}")
-        os.execvp(cmd[0], cmd)
+        run_interactive(cmd, f"SSM {instance_id}")
     elif name in ("--aws-ssh", "--aws-htop"):
-        box = _find_box(cfg, instance_id)
-        if not box:
+        # The menu passes the host it already knows so the window opens at
+        # once; fall back to an EC2 lookup when run by hand.
+        label = instance_id
+        if host and not HOST_RE.fullmatch(host):
+            notify(f"Invalid host: {host[:60]}")
             return
-        host = box.get("public_dns") or box.get("public_ip")
         if not host:
-            print(f"{box['name']} has no public address; use SSM instead.")
-            return
+            box = _find_box(cfg, instance_id)
+            if not box:
+                return
+            host = box.get("public_dns") or box.get("public_ip")
+            label = box["name"]
+            if not host:
+                notify(f"{box['name']} has no public address; use SSM instead.")
+                return
         cmd = ssh_base_cmd(cfg, host, batch=False)
         if name == "--aws-htop":
             cmd += ["-t", "command -v htop >/dev/null 2>&1 && exec htop || exec top"]
-        print(f"$ {' '.join(shlex.quote(c) for c in cmd)}")
-        os.execvp(cmd[0], cmd)
+        run_interactive(cmd, f"{'htop' if name == '--aws-htop' else 'ssh'} {label}")
 
 
 def setup() -> None:
@@ -1060,12 +1116,15 @@ INSTANCE_ACTIONS = {"--aws-start", "--aws-stop", "--aws-ssm", "--aws-ssh", "--aw
 
 if __name__ == "__main__":
     args = sys.argv[1:]
-    if len(args) == 2 and args[0] in INSTANCE_ACTIONS:
-        action(args[0], args[1])
+    if len(args) in (2, 3) and args[0] in INSTANCE_ACTIONS:
+        action(args[0], args[1], args[2] if len(args) == 3 else "")
     elif args == ["--aws-login"]:
         action("--aws-login", "")
     elif args == ["--aws-setup"]:
-        setup()
+        if sys.stdin.isatty():
+            setup()
+        else:  # launched from the menu: get a terminal first, then run setup in it
+            open_in_terminal([sys.executable, os.path.abspath(__file__), "--aws-setup"], "AWS dev box setup")
     elif args == ["--once"]:
         # Debug helper: one EC2 poll, a few seconds of metrics, one frame.
         st = State()
