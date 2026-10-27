@@ -13,6 +13,7 @@ sign-in you already have (SSO / `aws login`, named profiles, etc).
 
 from __future__ import annotations
 
+import base64
 import configparser
 import json
 import os
@@ -198,20 +199,36 @@ def parse_projects(raw: str) -> list[dict]:
     return projects
 
 
+GREEN, ORANGE, RED, GREY = "#34c759", "#ff9f0a", "#ff453a", "#8e8e93"
+
+
+def sf_icon(symbol: str, color: str = "", scale: str = "medium") -> str:
+    """SwiftBar params for a colored SF Symbol menu icon.
+
+    SwiftBar colors `sfimage` icons through `sfconfig`, a base64 JSON blob
+    (`sfcolor` only applies to symbols embedded inline in the text).
+    """
+    if not color:
+        return f"sfimage={symbol}"
+    cfg = {"renderingMode": "Hierarchical", "colors": [color], "scale": scale}
+    b64 = base64.b64encode(json.dumps(cfg, separators=(",", ":")).encode()).decode()
+    return f"sfimage={symbol} sfconfig={b64}"
+
+
 def status_icon(status: str) -> str:
     """SwiftBar params for a Baseten job status icon (SF Symbol + color)."""
     s = status.upper()
     if "RUNNING" in s:
-        return "sfimage=circle.fill sfcolor=#34c759"
+        return sf_icon("circle.fill", GREEN)
     if "CREATED" in s:
-        return "sfimage=circle.dotted sfcolor=#ff9f0a"
+        return sf_icon("circle.dotted", ORANGE)
     if "FAILED" in s:
-        return "sfimage=exclamationmark.triangle.fill sfcolor=#ff453a"
+        return sf_icon("exclamationmark.triangle.fill", RED)
     if "COMPLETED" in s:
-        return "sfimage=checkmark.circle.fill sfcolor=#8e8e93"
+        return sf_icon("checkmark.circle.fill", GREY)
     if "STOPPED" in s:
-        return "sfimage=stop.circle.fill sfcolor=#8e8e93"
-    return "sfimage=circle sfcolor=#8e8e93"
+        return sf_icon("stop.circle.fill", GREY)
+    return sf_icon("circle", GREY)
 
 
 # Backwards-compatible alias for anyone importing the old name.
@@ -808,7 +825,7 @@ def print_metrics_lines(metrics: dict) -> None:
     tail = " · ".join(x for x in (cores_label, load_label) if x)
     print(
         f"--CPU  {usage_bar(cpu)} {cpu if cpu is not None else '?':>3}%  {tail} "
-        f"| {mono} sfimage=cpu sfcolor={_usage_color(cpu)}"
+        f"| {mono} {sf_icon('cpu', _usage_color(cpu))}"
     )
 
     mem = _pct(metrics.get("mem_used_mb"), metrics.get("mem_total_mb"))
@@ -816,14 +833,14 @@ def print_metrics_lines(metrics: dict) -> None:
         print(
             f"--RAM  {usage_bar(mem)} {mem:>3.0f}%  "
             f"{_gb(metrics['mem_used_mb'])}/{_gb(metrics['mem_total_mb'])} GB "
-            f"| {mono} sfimage=memorychip sfcolor={_usage_color(mem)}"
+            f"| {mono} {sf_icon('memorychip', _usage_color(mem))}"
         )
     swap = _pct(metrics.get("swap_used_mb"), metrics.get("swap_total_mb"))
     if swap is not None and metrics.get("swap_used_mb", 0) > 0:
         print(
             f"--Swap {usage_bar(swap)} {swap:>3.0f}%  "
             f"{_gb(metrics['swap_used_mb'])}/{_gb(metrics['swap_total_mb'])} GB "
-            f"| {mono} sfimage=memorychip sfcolor={_usage_color(swap)}"
+            f"| {mono} {sf_icon('memorychip', _usage_color(swap))}"
         )
 
     for g in metrics.get("gpus", []):
@@ -833,12 +850,12 @@ def print_metrics_lines(metrics: dict) -> None:
         label = f"GPU{g['index']}" if len(metrics["gpus"]) > 1 else "GPU "
         print(
             f"--{label} {usage_bar(util)} {util if util is not None else '?':>3}%  "
-            f"{g['name']}{temp} | {mono} sfimage=rectangle.3.group sfcolor={_usage_color(util)}"
+            f"{g['name']}{temp} | {mono} {sf_icon('rectangle.3.group', _usage_color(util))}"
         )
         print(
             f"--VRAM {usage_bar(vram)} {vram if vram is not None else 0:>3.0f}%  "
             f"{_gb(g['vram_used_mb'])}/{_gb(g['vram_total_mb'])} GB "
-            f"| {mono} sfimage=memorychip.fill sfcolor={_usage_color(vram)}"
+            f"| {mono} {sf_icon('memorychip.fill', _usage_color(vram))}"
         )
 
     disk = _pct(metrics.get("disk_used_mb"), metrics.get("disk_total_mb"))
@@ -846,25 +863,25 @@ def print_metrics_lines(metrics: dict) -> None:
         print(
             f"--Disk {usage_bar(disk)} {disk:>3.0f}%  "
             f"{_gb(metrics['disk_used_mb'])}/{_gb(metrics['disk_total_mb'])} GB on / "
-            f"| {mono} sfimage=internaldrive sfcolor={_usage_color(disk)}"
+            f"| {mono} {sf_icon('internaldrive', _usage_color(disk))}"
         )
 
 
 def ec2_state_icon(box: dict) -> str:
     """SwiftBar params for an EC2 state icon (SF Symbol + color)."""
     if box.get("missing"):
-        return "sfimage=questionmark.circle sfcolor=#8e8e93"
+        return sf_icon("questionmark.circle", GREY)
     if box.get("impaired"):
-        return "sfimage=exclamationmark.triangle.fill sfcolor=#ff453a"
+        return sf_icon("exclamationmark.triangle.fill", RED)
     state = box.get("state", "")
     return {
-        "running": "sfimage=circle.fill sfcolor=#34c759",
-        "pending": "sfimage=circle.dotted sfcolor=#ff9f0a",
-        "stopping": "sfimage=circle.lefthalf.filled sfcolor=#ff9f0a",
-        "shutting-down": "sfimage=circle.lefthalf.filled sfcolor=#ff9f0a",
-        "stopped": "sfimage=stop.circle.fill sfcolor=#8e8e93",
-        "terminated": "sfimage=xmark.circle.fill sfcolor=#ff453a",
-    }.get(state, "sfimage=circle sfcolor=#8e8e93")
+        "running": sf_icon("circle.fill", GREEN),
+        "pending": sf_icon("circle.dotted", ORANGE),
+        "stopping": sf_icon("circle.lefthalf.filled", ORANGE),
+        "shutting-down": sf_icon("circle.lefthalf.filled", ORANGE),
+        "stopped": sf_icon("stop.circle.fill", GREY),
+        "terminated": sf_icon("xmark.circle.fill", RED),
+    }.get(state, sf_icon("circle", GREY))
 
 
 def ec2_console_url(box: dict, cfg: dict) -> str:
@@ -905,7 +922,7 @@ def print_aws_section(cfg: dict, fetched: dict) -> None:
     if not cfg["configured"]:
         print(header)
         if cfg["error"]:
-            print(f"--{cfg['error']} | sfimage=exclamationmark.triangle.fill sfcolor=#ff453a color=red size=12")
+            print(f"--{cfg['error']} | {sf_icon('exclamationmark.triangle.fill', RED)} color=red size=12")
             if "permissions" in cfg["error"]:
                 print(
                     f"--Fix permissions (chmod 600) | bash=/bin/chmod param1=600 "
@@ -921,11 +938,11 @@ def print_aws_section(cfg: dict, fetched: dict) -> None:
 
     print(header)
     for w in cfg["warnings"]:
-        print(f"--{w} | sfimage=exclamationmark.triangle sfcolor=#ff9f0a color=orange size=12")
+        print(f"--{w} | {sf_icon('exclamationmark.triangle', ORANGE)} color=orange size=12")
 
     if fetched["auth_error"]:
         login = " ".join(aws_login_cmd(cfg))
-        print("AWS sign-in required | sfimage=lock.fill sfcolor=#ff9f0a color=orange")
+        print(f"AWS sign-in required | {sf_icon('lock.fill', ORANGE)} color=orange")
         print(f"--{fetched['error']} | size=12")
         print(
             f"--Sign in ({login}) | bash={python} param1={script} "
@@ -933,7 +950,7 @@ def print_aws_section(cfg: dict, fetched: dict) -> None:
         )
         return
     if fetched["error"]:
-        print(f"{fetched['error']} | sfimage=exclamationmark.triangle.fill sfcolor=#ff453a color=red")
+        print(f"{fetched['error']} | {sf_icon('exclamationmark.triangle.fill', RED)} color=red")
         return
 
     for box in fetched["boxes"]:
@@ -968,7 +985,7 @@ def print_aws_section(cfg: dict, fetched: dict) -> None:
         elif box.get("metrics_error") and state == "running":
             print(
                 f"--Usage unavailable: {box['metrics_error']} "
-                f"| sfimage=exclamationmark.triangle sfcolor=#8e8e93 color=gray size=11"
+                f"| {sf_icon('exclamationmark.triangle', GREY)} color=gray size=11"
             )
             print("-----")
 
