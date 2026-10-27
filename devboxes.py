@@ -828,7 +828,15 @@ def _fmt_pct(p: float | None) -> str:
     return "  ?" if p is None else f"{p:>3.0f}"
 
 
+def _vram_pct(m: dict) -> float | None:
+    """Overall VRAM use across GPUs, or None when the box has none."""
+    used = sum(g["vram_used_mb"] for g in m.get("gpus", []) if g.get("vram_used_mb") is not None)
+    total = sum(g["vram_total_mb"] for g in m.get("gpus", []) if g.get("vram_total_mb"))
+    return _pct(used, total) if total else None
+
+
 def metrics_summary(m: dict) -> str:
+    """Dropdown summary: CPU · RAM · GPU util (and VRAM) when present."""
     bits = []
     if m.get("cpu_pct") is not None:
         bits.append(f"CPU {m['cpu_pct']}%")
@@ -838,7 +846,33 @@ def metrics_summary(m: dict) -> str:
     utils = [g["util_pct"] for g in m.get("gpus", []) if g.get("util_pct") is not None]
     if utils:
         bits.append(f"GPU {max(utils)}%")
+    vram = _vram_pct(m)
+    if vram is not None:
+        bits.append(f"VRAM {vram:.0f}%")
     return " · ".join(bits)
+
+
+def _truncate(text: str, n: int) -> str:
+    return text if len(text) <= n else text[: n - 1] + "…"
+
+
+def title_preview(box: dict, m: dict | None) -> str:
+    """Menu bar text for one box: SKU, short name, CPU · RAM · VRAM."""
+    parts = [box.get("type", ""), _truncate(box.get("name", box["id"]), 12)]
+    text = " ".join(p for p in parts if p)
+    if m:
+        bits = []
+        if m.get("cpu_pct") is not None:
+            bits.append(f"CPU {m['cpu_pct']}%")
+        mem = _pct(m.get("mem_used_mb"), m.get("mem_total_mb"))
+        if mem is not None:
+            bits.append(f"RAM {mem:.0f}%")
+        vram = _vram_pct(m)
+        if vram is not None:
+            bits.append(f"VRAM {vram:.0f}%")
+        if bits:
+            text += " · " + " · ".join(bits)
+    return text
 
 
 def metrics_lines(m: dict, age: float) -> list[str]:
@@ -942,32 +976,35 @@ def render(snap: dict) -> str:
             None,
         )
         if pinned:
-            # One box in the menu bar: its name plus its live usage.
+            # One box in the menu bar: SKU, short name, CPU · RAM · VRAM.
             entry = snap["metrics"].get(pinned["id"])
-            text = pinned.get("name", pinned["id"])
+            fresh = entry["m"] if entry and now - entry["at"] <= STALE_AFTER else None
             if pinned.get("state") != "running":
-                text += f": {pinned.get('state', 'unknown')}"
-                lines.append(f"{text} | color=gray")
+                lines.append(f"{title_preview(pinned, None)}: {pinned.get('state', 'unknown')} | color=gray")
             else:
-                if entry and now - entry["at"] <= STALE_AFTER:
-                    summary = metrics_summary(entry["m"])
-                    if summary:
-                        text += f" · {summary}"
+                text = title_preview(pinned, fresh)
                 lines.append(f"{text} | color=red" if pinned.get("impaired") else text)
         else:
-            cpus, gpus = [], []
+            cpus, rams, vrams = [], [], []
             for b in running:
                 entry = snap["metrics"].get(b["id"])
                 if entry and now - entry["at"] <= STALE_AFTER:
                     m = entry["m"]
                     if m.get("cpu_pct") is not None:
                         cpus.append(m["cpu_pct"])
-                    gpus += [g["util_pct"] for g in m.get("gpus", []) if g.get("util_pct") is not None]
+                    ram = _pct(m.get("mem_used_mb"), m.get("mem_total_mb"))
+                    if ram is not None:
+                        rams.append(ram)
+                    vram = _vram_pct(m)
+                    if vram is not None:
+                        vrams.append(vram)
             text = f"EC2: {len(running)}/{len(boxes)} up"
             if cpus:
                 text += f" · CPU {max(cpus)}%"
-            if gpus:
-                text += f" · GPU {max(gpus)}%"
+            if rams:
+                text += f" · RAM {max(rams):.0f}%"
+            if vrams:
+                text += f" · VRAM {max(vrams):.0f}%"
             if any(b.get("impaired") for b in running):
                 lines.append(f"{text} ⚠ | color=red")
             else:
