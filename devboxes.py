@@ -755,18 +755,19 @@ def sf_icon(symbol: str, color: str = "", scale: str = "medium") -> str:
 
 
 def box_icon(box: dict) -> str:
+    """Simple colored dot for the box state (the one icon we use)."""
     if box.get("missing"):
-        return sf_icon("questionmark.circle", GREY)
+        return sf_icon("circle", GREY)
     if box.get("impaired"):
-        return sf_icon("exclamationmark.triangle.fill", RED)
+        return sf_icon("circle.fill", RED)
     return {
-        "running": sf_icon("power.circle.fill", GREEN),
-        "pending": sf_icon("hourglass.circle.fill", ORANGE),
-        "stopping": sf_icon("power.circle", ORANGE),
-        "shutting-down": sf_icon("power.circle", ORANGE),
-        "stopped": sf_icon("moon.zzz.fill", GREY),
-        "terminated": sf_icon("xmark.circle.fill", RED),
-    }.get(box.get("state", ""), sf_icon("circle.dashed", GREY))
+        "running": sf_icon("circle.fill", GREEN),
+        "pending": sf_icon("circle.fill", ORANGE),
+        "stopping": sf_icon("circle.fill", ORANGE),
+        "shutting-down": sf_icon("circle.fill", ORANGE),
+        "stopped": sf_icon("circle.fill", GREY),
+        "terminated": sf_icon("circle.fill", RED),
+    }.get(box.get("state", ""), sf_icon("circle", GREY))
 
 
 def elapsed_time(created_at: str, now: datetime | None = None) -> str:
@@ -794,11 +795,11 @@ def elapsed_time(created_at: str, now: datetime | None = None) -> str:
     return "<1m"
 
 
-def usage_bar(pct: float | None, width: int = 12) -> str:
+def usage_bar(pct: float | None, width: int = 10) -> str:
     if pct is None:
-        return "·" * width
+        return "░" * width
     filled = max(0, min(width, round(pct / 100 * width)))
-    return "▰" * filled + "▱" * (width - filled)
+    return "█" * filled + "░" * (width - filled)
 
 
 def _gb(mb: int | None) -> str:
@@ -845,43 +846,33 @@ def metrics_lines(m: dict, age: float) -> list[str]:
     out = []
     stale = f"  (stale {age:.0f}s)" if age > STALE_AFTER else ""
 
+    def row(label: str, pct: float | None, detail: str) -> str:
+        # Text only; a hot row turns orange/red via the line color.
+        color = "" if pct is None or pct < 70 else f" color={_usage_color(pct)}"
+        return f"--{label} {usage_bar(pct)} {_fmt_pct(pct)}%  {detail} | {mono}{color}"
+
     cpu = m.get("cpu_pct")
     tail = " · ".join(x for x in (
         f"{m['cores']} cores" if m.get("cores") else "",
         f"load {m['load']}" if m.get("load") else "",
     ) if x)
-    out.append(f"--CPU  {usage_bar(cpu)} {_fmt_pct(cpu)}%  {tail}{stale} | {mono} {sf_icon('cpu', _usage_color(cpu))}")
+    out.append(row("CPU ", cpu, tail + stale))
 
     mem = _pct(m.get("mem_used_mb"), m.get("mem_total_mb"))
     if mem is not None:
-        out.append(
-            f"--RAM  {usage_bar(mem)} {_fmt_pct(mem)}%  {_gb(m['mem_used_mb'])}/{_gb(m['mem_total_mb'])} GB "
-            f"| {mono} {sf_icon('memorychip', _usage_color(mem))}"
-        )
+        out.append(row("RAM ", mem, f"{_gb(m['mem_used_mb'])}/{_gb(m['mem_total_mb'])} GB"))
     swap = _pct(m.get("swap_used_mb"), m.get("swap_total_mb"))
     if swap is not None and m.get("swap_used_mb", 0) > 0:
-        out.append(
-            f"--Swap {usage_bar(swap)} {_fmt_pct(swap)}%  {_gb(m['swap_used_mb'])}/{_gb(m['swap_total_mb'])} GB "
-            f"| {mono} {sf_icon('memorychip', _usage_color(swap))}"
-        )
+        out.append(row("Swap", swap, f"{_gb(m['swap_used_mb'])}/{_gb(m['swap_total_mb'])} GB"))
     for g in m.get("gpus", []):
         util, vram = g.get("util_pct"), _pct(g.get("vram_used_mb"), g.get("vram_total_mb"))
         temp = f" · {g['temp_c']}°C" if g.get("temp_c") is not None else ""
         label = f"GPU{g['index']}" if len(m["gpus"]) > 1 else "GPU "
-        out.append(
-            f"--{label} {usage_bar(util)} {_fmt_pct(util)}%  {g['name']}{temp} "
-            f"| {mono} {sf_icon('rectangle.3.group', _usage_color(util))}"
-        )
-        out.append(
-            f"--VRAM {usage_bar(vram)} {_fmt_pct(vram)}%  {_gb(g['vram_used_mb'])}/{_gb(g['vram_total_mb'])} GB "
-            f"| {mono} {sf_icon('memorychip.fill', _usage_color(vram))}"
-        )
+        out.append(row(label, util, f"{g['name']}{temp}"))
+        out.append(row("VRAM", vram, f"{_gb(g['vram_used_mb'])}/{_gb(g['vram_total_mb'])} GB"))
     disk = _pct(m.get("disk_used_mb"), m.get("disk_total_mb"))
     if disk is not None:
-        out.append(
-            f"--Disk {usage_bar(disk)} {_fmt_pct(disk)}%  {_gb(m['disk_used_mb'])}/{_gb(m['disk_total_mb'])} GB on / "
-            f"| {mono} {sf_icon('internaldrive', _usage_color(disk))}"
-        )
+        out.append(row("Disk", disk, f"{_gb(m['disk_used_mb'])}/{_gb(m['disk_total_mb'])} GB on /"))
     return out
 
 
@@ -895,17 +886,16 @@ def process_lines(m: dict) -> list[str]:
         return out
 
     out.append("-----")
-    out.append("--Running code | size=11 color=gray")
+    out.append(f"--{'CPU%':>5} {'MEM%':>5} {'TIME':>6}  PROCESS | {mono} color=gray")
     for g in groups:
-        count = f"{g['count']}× " if g["count"] > 1 else ""
+        count = f"{g['count']}x " if g["count"] > 1 else ""
         project = f"[{g['project']}] " if g["project"] else ""
         user = f" ({g['user']})" if g["user"] not in ("ubuntu", "ec2-user", "") else ""
         label = f"{count}{project}{g['cmd']}{user}"
-        stats = f"{g['cpu']:>4.0f}% cpu {g['mem']:>4.1f}% mem {_fmt_secs(g['etime']):>6}"
-        out.append(f"--{stats}  {label} | {mono} length=120 {sf_icon('chevron.right', GREY, 'small')}")
+        stats = f"{g['cpu']:>4.0f}% {g['mem']:>4.1f}% {_fmt_secs(g['etime']):>6}"
+        out.append(f"--{stats}  {label} | {mono} length=120")
 
     if gpu_procs:
-        # Attribute GPU memory to the process' project when we can.
         by_pid = {p["pid"]: p for p in m.get("procs", [])}
         for gp in gpu_procs:
             proc = by_pid.get(gp["pid"])
@@ -914,8 +904,8 @@ def process_lines(m: dict) -> list[str]:
             else:
                 project, short = _project_label(gp["name"]), os.path.basename(gp["name"])
             label = (f"[{project}] " if project else "") + (short or gp["name"])
-            vram = f"{gp['vram_mb']} MiB" if gp.get("vram_mb") is not None else "?"
-            out.append(f"--GPU {vram:>9}  pid {gp['pid']}  {label} | {mono} length=120 {sf_icon('rectangle.3.group', BLUE, 'small')}")
+            vram = f"{gp['vram_mb']}M" if gp.get("vram_mb") is not None else "?"
+            out.append(f"--{'GPU':>5} {vram:>6} {'pid ' + gp['pid']:>11}  {label} | {mono} length=120")
     return out
 
 
@@ -936,16 +926,13 @@ def render(snap: dict) -> str:
     now = time.time()
     lines: list[str] = []
 
-    # ---- title -----------------------------------------------------------
+    # ---- title (plain text, like the Baseten plugin's "BT: ...") ----------
     if not cfg["configured"]:
-        if cfg["error"]:
-            lines.append(f"EC2 | {sf_icon('exclamationmark.triangle.fill', RED)}")
-        else:
-            lines.append(f"EC2 | {sf_icon('server.rack', GREY)}")
+        lines.append("EC2: config err | color=red" if cfg["error"] else "EC2: setup")
     elif fetched["auth_error"]:
-        lines.append(f"EC2 sign in | {sf_icon('lock.fill', ORANGE)} color=orange")
+        lines.append("EC2: sign in | color=orange")
     elif fetched["error"]:
-        lines.append(f"EC2 err | {sf_icon('exclamationmark.triangle.fill', RED)} color=red")
+        lines.append("EC2: err | color=red")
     else:
         boxes = fetched["boxes"]
         running = [b for b in boxes if b.get("state") == "running"]
@@ -959,12 +946,14 @@ def render(snap: dict) -> str:
             entry = snap["metrics"].get(pinned["id"])
             text = pinned.get("name", pinned["id"])
             if pinned.get("state") != "running":
-                text += f" · {pinned.get('state', 'unknown')}"
-            elif entry and now - entry["at"] <= STALE_AFTER:
-                summary = metrics_summary(entry["m"])
-                if summary:
-                    text += f" · {summary}"
-            lines.append(f"{text} | {box_icon(pinned)}")
+                text += f": {pinned.get('state', 'unknown')}"
+                lines.append(f"{text} | color=gray")
+            else:
+                if entry and now - entry["at"] <= STALE_AFTER:
+                    summary = metrics_summary(entry["m"])
+                    if summary:
+                        text += f" · {summary}"
+                lines.append(f"{text} | color=red" if pinned.get("impaired") else text)
         else:
             cpus, gpus = [], []
             for b in running:
@@ -974,48 +963,45 @@ def render(snap: dict) -> str:
                     if m.get("cpu_pct") is not None:
                         cpus.append(m["cpu_pct"])
                     gpus += [g["util_pct"] for g in m.get("gpus", []) if g.get("util_pct") is not None]
-            text = f"{len(running)}/{len(boxes)}"
+            text = f"EC2: {len(running)}/{len(boxes)} up"
             if cpus:
                 text += f" · CPU {max(cpus)}%"
             if gpus:
                 text += f" · GPU {max(gpus)}%"
             if any(b.get("impaired") for b in running):
-                icon = sf_icon("exclamationmark.triangle.fill", RED)
-            elif running:
-                icon = sf_icon("server.rack", GREEN)
+                lines.append(f"{text} ⚠ | color=red")
             else:
-                icon = sf_icon("server.rack", GREY)
-            lines.append(f"{text} | {icon}")
+                lines.append(text)
 
     lines.append("---")
 
     # ---- body ------------------------------------------------------------
     scope = " · ".join(x for x in (cfg.get("profile"), cfg.get("region")) if x)
-    lines.append("AWS Dev Boxes" + (f" ({scope})" if scope else "") + " | size=12 color=gray")
+    lines.append("AWS Dev Boxes" + (f" ({scope})" if scope else ""))
 
     if not cfg["configured"]:
         if cfg["error"]:
-            lines.append(f"{cfg['error']} | {sf_icon('exclamationmark.triangle.fill', RED)} color=red size=12")
+            lines.append(f"--⚠️ {cfg['error']} | color=red size=12")
             if "permissions" in cfg["error"]:
                 lines.append(
-                    f"Fix permissions (chmod 600) | bash=/bin/chmod param1=600 "
+                    f"--Fix permissions (chmod 600) | bash=/bin/chmod param1=600 "
                     f"param2={shlex.quote(CONFIG_PATH)} terminal=false refresh=true"
                 )
         else:
-            lines.append("Not configured | size=12")
-        lines.append(f"Set up AWS dev boxes… | {sf_icon('gearshape')} {me} param2=--aws-setup terminal=false refresh=true")
+            lines.append("--Not configured | size=12")
+        lines.append(f"--Set up AWS dev boxes… | {me} param2=--aws-setup terminal=false refresh=true")
         return "\n".join(lines)
 
     for w in cfg["warnings"]:
-        lines.append(f"{w} | {sf_icon('exclamationmark.triangle', ORANGE)} color=orange size=12")
+        lines.append(f"--⚠️ {w} | color=orange size=12")
 
     if fetched["auth_error"]:
         login = " ".join(aws_login_cmd(cfg))
-        lines.append(f"AWS sign-in required | {sf_icon('lock.fill', ORANGE)} color=orange")
+        lines.append("🔐 AWS sign-in required | color=orange")
         lines.append(f"--{fetched['error']} | size=12")
         lines.append(f"--Sign in ({login}) | {me} param2=--aws-login terminal=false refresh=true")
     elif fetched["error"]:
-        lines.append(f"{fetched['error']} | {sf_icon('exclamationmark.triangle.fill', RED)} color=red")
+        lines.append(f"⚠️ {fetched['error']} | color=red")
     elif not fetched["boxes"] and snap["last_poll"] == 0:
         lines.append("Loading… | color=gray")
 
@@ -1027,7 +1013,7 @@ def render(snap: dict) -> str:
             continue
 
         up = elapsed_time(box.get("launch_time", "")) if state == "running" else ""
-        type_label = f" · {box['type']}" if box.get("type") else ""
+        type_label = f" [{box['type']}]" if box.get("type") else ""
         up_label = f" · up {up}" if up else ""
         url = console_url(box, cfg)
         host = box.get("public_dns") or box.get("public_ip") or ""
@@ -1042,11 +1028,10 @@ def render(snap: dict) -> str:
         entry = snap["metrics"].get(box["id"])
         m = entry["m"] if entry else None
         age = now - entry["at"] if entry else 0
-        summary = f"   {metrics_summary(m)}" if m else ""
-        state_label = "" if state == "running" else f" — {state}"
+        summary = f" · {metrics_summary(m)}" if m else ""
         is_pinned = bool(cfg.get("pinned")) and cfg["pinned"] in (box["id"], name)
         pin_flag = " checked=true" if is_pinned else ""
-        lines.append(f"{name}{state_label}{type_label}{up_label}{summary} | {icon} {click}{pin_flag}")
+        lines.append(f"{name} — {state}{up_label}{type_label}{summary} | {icon} {click}{pin_flag}")
 
         if m:
             lines.extend(metrics_lines(m, age))
@@ -1055,51 +1040,51 @@ def render(snap: dict) -> str:
         elif state == "running" and has_public:
             err = snap["metrics_err"].get(box["id"])
             msg = f"Usage unavailable: {err}" if err else "Connecting for usage…"
-            lines.append(f"--{msg} | {sf_icon('antenna.radiowaves.left.and.right', GREY)} color=gray size=11")
+            lines.append(f"--{msg} | color=gray size=11")
             lines.append("-----")
 
-        lines.append(f"--Instance ID: {box['id']} | font=Menlo size=12")
+        lines.append(f"--Instance ID: {box['id']} | font=monospace size=12")
         if box.get("type"):
             lines.append(f"--Type: {box['type']} · {box.get('az', '')} | size=12")
         if box.get("public_ip"):
-            lines.append(f"--Public IP: {box['public_ip']} | font=Menlo size=12")
+            lines.append(f"--Public IP: {box['public_ip']} | font=monospace size=12")
         if box.get("private_ip"):
-            lines.append(f"--Private IP: {box['private_ip']} | font=Menlo size=12")
+            lines.append(f"--Private IP: {box['private_ip']} | font=monospace size=12")
         if box.get("status_checks"):
             lines.append(f"--Status checks: {box['status_checks']} | size=12")
         if box.get("launch_time"):
             lines.append(f"--Launched: {box['launch_time']} | size=12")
         lines.append("-----")
-        if state == "running" and has_public:
-            lines.append(f"--SSH (Terminal) | {sf_icon('terminal')} {me} param2=--aws-ssh param3={box['id']} param4={host} terminal=false")
-            lines.append(f"--Open htop (Terminal) | {sf_icon('chart.bar.xaxis')} {me} param2=--aws-htop param3={box['id']} param4={host} terminal=false")
+        lines.append(f"--Open in AWS Console | href={url}")
         if state == "running":
-            lines.append(f"--Connect via SSM (Terminal) | {sf_icon('network')} {me} param2=--aws-ssm param3={box['id']} terminal=false")
-        lines.append(f"--Open in AWS Console | {sf_icon('safari')} href={url}")
+            lines.append(f"--Connect via SSM (Terminal) | {me} param2=--aws-ssm param3={box['id']} terminal=false")
+        if state == "running" and has_public:
+            lines.append(f"--SSH (Terminal) | {me} param2=--aws-ssh param3={box['id']} param4={host} terminal=false")
+            lines.append(f"--Open htop (Terminal) | {me} param2=--aws-htop param3={box['id']} param4={host} terminal=false")
         if is_pinned:
-            lines.append(f"--Unpin from menu bar | {sf_icon('pin.slash')} {me} param2=--aws-unpin terminal=false")
+            lines.append(f"--Unpin from menu bar | {me} param2=--aws-unpin terminal=false")
         else:
-            lines.append(f"--Pin to menu bar | {sf_icon('pin')} {me} param2=--aws-pin param3={box['id']} terminal=false")
+            lines.append(f"--Pin to menu bar | {me} param2=--aws-pin param3={box['id']} terminal=false")
         if box.get("public_ip"):
             lines.append(
-                f"--Copy Public IP | {sf_icon('doc.on.doc')} bash=/bin/bash param1=-c "
+                f"--Copy Public IP | bash=/bin/bash param1=-c "
                 f"param2='echo -n {box['public_ip']} | pbcopy' terminal=false"
             )
         lines.append(
-            f"--Copy Instance ID | {sf_icon('doc.on.doc')} bash=/bin/bash param1=-c "
+            f"--Copy Instance ID | bash=/bin/bash param1=-c "
             f"param2='echo -n {box['id']} | pbcopy' terminal=false"
         )
         if state == "stopped":
-            lines.append(f"--Start instance | {sf_icon('play.fill', GREEN)} {me} param2=--aws-start param3={box['id']} terminal=false")
+            lines.append(f"--▶ Start instance | {me} param2=--aws-start param3={box['id']} terminal=false")
         elif state == "running":
-            lines.append(f"--Stop instance… | {sf_icon('stop.fill', RED)} {me} param2=--aws-stop param3={box['id']} terminal=false")
+            lines.append(f"--■ Stop instance… | {me} param2=--aws-stop param3={box['id']} terminal=false")
 
     lines.append("---")
     age = now - snap["last_poll"] if snap["last_poll"] else None
     polled = f"EC2 state polled {age:.0f}s ago · usage every {METRICS_PERIOD:.0f}s" if age is not None else "Polling EC2…"
     lines.append(f"{polled} | size=11 color=gray")
-    lines.append(f"Edit AWS dev box settings… | {sf_icon('gearshape')} {me} param2=--aws-setup terminal=false refresh=true")
-    lines.append("Refresh now | refresh=true")
+    lines.append(f"Edit AWS dev box settings… | {me} param2=--aws-setup terminal=false refresh=true")
+    lines.append("Refresh | refresh=true")
     return "\n".join(lines)
 
 

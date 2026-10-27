@@ -10,7 +10,7 @@ Two macOS menu bar plugins for [SwiftBar](https://github.com/swiftbar/SwiftBar):
 ### Baseten training jobs
 
 - Live job status in your menu bar (refreshes every 1 minute)
-- Color-coded status icons (native SF Symbols): green play for running, orange hourglass for starting, red stop sign for failed, grey check or stop for completed and stopped
+- Color-coded status dots: green running, orange starting, red failed, grey stopped or completed
 - GPU count summary across active jobs
 - Launcher and elapsed runtime for each active job
 - Click any job to open it in the Baseten dashboard
@@ -20,11 +20,11 @@ Two macOS menu bar plugins for [SwiftBar](https://github.com/swiftbar/SwiftBar):
 
 ### AWS dev boxes (optional, `devboxes.py`)
 
-- Its own menu bar item with a server icon (green when boxes are up) and a live summary, e.g. `2/2 · CPU 21% · GPU 87%`
+- Its own menu bar item with a live summary, e.g. `EC2: 2/2 up · CPU 21% · GPU 87%`
 - **Pin to menu bar** in any box's dropdown puts that one box in the menu bar instead, by name with its live usage, e.g. `Ishaan-extend · CPU 21% · RAM 35% · GPU 0%`. The pinned box shows a checkmark in the list; **Unpin from menu bar** goes back to the summary.
-- Per-box state icon: green power for running, orange hourglass for pending, grey moon for stopped, red warning for impaired status checks. Plus instance type, uptime, public and private IP.
-- Live usage inside each box's menu, updated every 2 seconds: CPU % with core count and load average, RAM, swap (when in use), disk on `/`, and on GPU boxes each GPU's utilization, VRAM, and temperature from `nvidia-smi`. A compact `CPU 32% · RAM 41% · GPU 87%` summary sits on the box's main line. Bars turn orange above 70% and red above 90%.
-- A **Running code** list under the usage bars shows what is actually running on the box, grouped by project and command rather than by process, e.g. `822% cpu 6.5% mem 18m  10× [ocr-bench-scoring] python -m ocr_bench.cli rescore --datasets …`. The project label comes from the virtualenv or repo directory in the command path. Identical workers collapse into one row with a count, long paths are shortened, and processes running as another user are marked. GPU boxes also list which process holds how much VRAM.
+- Per-box state dot (green running, orange pending, grey stopped, red impaired), instance type, uptime, public and private IP.
+- Live usage inside each box's menu, updated every 2 seconds: CPU % with core count and load average, RAM, swap (when in use), disk on `/`, and on GPU boxes each GPU's utilization, VRAM, and temperature from `nvidia-smi`. A compact `CPU 32% · RAM 41% · GPU 87%` summary sits on the box's main line. Rows turn orange above 70% and red above 90%.
+- A process table under the usage bars shows what is actually running on the box, grouped by project and command rather than by process, e.g. `822% cpu 6.5% mem 18m  10× [ocr-bench-scoring] python -m ocr_bench.cli rescore --datasets …`. The project label comes from the virtualenv or repo directory in the command path. Identical workers collapse into one row with a count, long paths are shortened, and processes running as another user are marked. GPU boxes also list which process holds how much VRAM.
 - Each box keeps one persistent SSH session open for the metrics stream. If the connection drops (laptop sleep, network change) it reconnects by itself, and stale readings are labelled.
 - Clicking a running box opens an SSH session in Terminal (or an SSM session if the box has no public address). Clicking a stopped box opens it in the AWS console.
 - Submenu actions: open `htop` in Terminal, open in the AWS console, connect via SSM or SSH, copy the IP or instance ID, start a stopped box, or stop a running one (with a confirmation dialog)

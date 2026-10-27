@@ -213,16 +213,14 @@ def status_icon(status: str) -> str:
     """SwiftBar params for a Baseten job status icon (SF Symbol + color)."""
     s = status.upper()
     if "RUNNING" in s:
-        return sf_icon("play.circle.fill", GREEN)
+        return sf_icon("circle.fill", GREEN)
     if "CREATED" in s:
-        return sf_icon("hourglass.circle.fill", ORANGE)
+        return sf_icon("circle.fill", ORANGE)
     if "FAILED" in s:
-        return sf_icon("xmark.octagon.fill", RED)
-    if "COMPLETED" in s:
-        return sf_icon("checkmark.circle.fill", GREY)
-    if "STOPPED" in s:
-        return sf_icon("stop.circle.fill", GREY)
-    return sf_icon("circle.dashed", GREY)
+        return sf_icon("circle.fill", RED)
+    if "STOPPED" in s or "COMPLETED" in s:
+        return sf_icon("circle.fill", GREY)
+    return sf_icon("circle", GREY)
 
 
 def parse_gpu_info(instance: str) -> str:
@@ -421,14 +419,14 @@ def main():
             duration_name = "Running for" if "RUNNING" in status.upper() else "Elapsed"
             print(f"--{duration_name}: {elapsed} | size=12")
         print(f"--Created: {created_at} | size=12")
-        print(f"--Open Baseten Logs | {sf_icon('safari')} href={url}")
+        print(f"--Open Baseten Logs | href={url}")
         python = shlex.quote(sys.executable)
         script = shlex.quote(os.path.abspath(__file__))
         print(
-            f"--Open W&B Run | {sf_icon('chart.xyaxis.line')} bash={python} param1={script} "
+            f"--Open W&B Run | bash={python} param1={script} "
             f"param2=--open-wandb param3={job_id} terminal=false refresh=false"
         )
-        print(f"--Copy Job ID | {sf_icon('doc.on.doc')} bash=/bin/bash param1=-c param2='echo -n {job_id} | pbcopy' terminal=false")
+        print(f"--Copy Job ID | bash=/bin/bash param1=-c param2='echo -n {job_id} | pbcopy' terminal=false")
 
     # Show all projects
     print("---")
