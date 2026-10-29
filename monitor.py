@@ -93,6 +93,7 @@ REGION_RE = re.compile(r"[a-z]{2}(-[a-z]+)+-\d")
 
 AWS_TIMEOUT = 25           # seconds for a single aws CLI call
 EC2_POLL_INTERVAL = 60     # seconds between EC2 state polls
+EC2_RETRY_INTERVAL = 10    # faster re-check while signed out or erroring, so sign-in shows up quickly
 # How often usage (CPU/RAM/GPU/processes) is sampled on each box and on this
 # Mac, and how often the menu redraws. Chosen from the dropdown; stored as
 # BTMON_USAGE_INTERVAL. 10s is a light touch on the boxes; pick 2s when you
@@ -275,8 +276,8 @@ def aws_base_cmd(cfg: dict) -> list[str]:
     return cmd
 
 
-def aws_login_cmd(cfg: dict) -> list[str]:
-    """Pick the sign-in command that matches the profile's config."""
+def _profile_keys(cfg: dict) -> tuple[str, set[str]]:
+    """(profile name, keys present in its ~/.aws/config section)."""
     profile = cfg.get("profile") or os.environ.get("AWS_PROFILE") or "default"
     section = "default" if profile == "default" else f"profile {profile}"
     parser = configparser.RawConfigParser()
@@ -285,12 +286,36 @@ def aws_login_cmd(cfg: dict) -> list[str]:
     except (configparser.Error, OSError):
         pass
     keys = set(parser[section].keys()) if parser.has_section(section) else set()
+    return profile, keys
+
+
+def profile_uses_sso(cfg: dict) -> bool:
+    """True when the profile is wired to IAM Identity Center (an org start URL)."""
+    _, keys = _profile_keys(cfg)
+    return "sso_session" in keys or "sso_start_url" in keys
+
+
+def aws_login_cmd(cfg: dict) -> list[str]:
+    """Pick the sign-in command that matches the profile's config.
+
+    IAM Identity Center (SSO) wins when present: `aws sso login` sends the
+    browser to the org's own start URL, which lives in the user's
+    ~/.aws/config and never in this plugin. Plain `aws login` only works
+    when the user already has a console session, so it is the fallback.
+    """
+    profile, _ = _profile_keys(cfg)
     profile_args = ["--profile", profile] if cfg.get("profile") else []
-    if "login_session" in keys:
-        return ["aws", "login", *profile_args]
-    if "sso_session" in keys or "sso_start_url" in keys:
+    if profile_uses_sso(cfg):
         return ["aws", "sso", "login", *profile_args]
     return ["aws", "login", *profile_args]
+
+
+def aws_configure_sso_cmd(cfg: dict) -> list[str]:
+    """The AWS CLI's own wizard: asks for the org start URL and region, opens
+    the browser, lets the user pick account and role, and writes the result
+    into ~/.aws/config under this profile."""
+    profile, _ = _profile_keys(cfg)
+    return ["aws", "configure", "sso", "--profile", profile]
 
 
 def _looks_like_auth_error(stderr: str) -> bool:
@@ -1570,7 +1595,12 @@ def render_aws(snap: dict, me: str, now: float) -> list[str]:
         login = " ".join(aws_login_cmd(cfg))
         lines.append("🔐 AWS sign-in required | color=orange")
         lines.append(f"--{fetched['error']} | size=12")
-        lines.append(f"--Sign in ({login}) | {me} param2=--aws-login terminal=false refresh=true")
+        lines.append(f"--Sign in ({login}) | {me} param2=--aws-login terminal=false")
+        if not profile_uses_sso(cfg):
+            lines.append("-----")
+            lines.append("--Does your org sign in through a start URL like https://xxx.awsapps.com/start ? | size=11 color=gray")
+            lines.append("--Then set up SSO once; after that Sign in opens your org's page. | size=11 color=gray")
+            lines.append(f"--Set up SSO sign-in (aws configure sso)… | {me} param2=--aws-configure-sso terminal=false")
     elif fetched["error"]:
         lines.append(f"⚠️ {fetched['error']} | color=red")
     elif not fetched["boxes"] and snap["last_poll"] == 0:
@@ -1707,7 +1737,9 @@ def stream_forever() -> None:
             except Exception as exc:  # keep the stream alive no matter what
                 with state.lock:
                     state.fetched = {"boxes": [], "error": f"poll failed: {exc}"[:200], "auth_error": False}
-            time.sleep(EC2_POLL_INTERVAL)
+            with state.lock:
+                unhealthy = bool(state.fetched.get("error")) or state.fetched.get("auth_error")
+            time.sleep(EC2_RETRY_INTERVAL if unhealthy else EC2_POLL_INTERVAL)
 
     def bt_poller():
         while True:
@@ -1750,6 +1782,9 @@ def stream_forever() -> None:
 LAUNCH_DIR = os.path.expanduser("~/Library/Application Support/baseten-job-monitor/launch")
 
 
+REFRESH_SELF = ["/usr/bin/open", "-g", "swiftbar://refreshplugin?name=monitor"]
+
+
 def _terminal_app() -> str:
     """Honor SwiftBar's terminal preference (Terminal or iTerm); default Terminal."""
     try:
@@ -1762,7 +1797,7 @@ def _terminal_app() -> str:
     return "iTerm" if "iterm" in out else "Terminal"
 
 
-def open_in_terminal(cmd: list[str], title: str) -> None:
+def open_in_terminal(cmd: list[str], title: str, after: list[str] | None = None) -> None:
     """Open a new terminal window running `cmd`.
 
     SwiftBar's own `terminal=false` drives Terminal through AppleScript and
@@ -1780,20 +1815,28 @@ def open_in_terminal(cmd: list[str], title: str) -> None:
         'rm -f "$0"\n'  # one-shot launcher; the shell already has it open
         f"printf '\\033]0;%s\\007' {shlex.quote(safe_title)}\n"
         f"echo {shlex.quote('$ ' + quoted)}\n"
-        f"exec {quoted}\n"
     )
+    if after:
+        # Run the main command, then the follow-up regardless of its exit code.
+        body += f"{quoted}; rc=$?\n{' '.join(shlex.quote(c) for c in after)}\nexit $rc\n"
+    else:
+        body += f"exec {quoted}\n"
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o700)
     with os.fdopen(fd, "w", encoding="utf-8") as fh:
         fh.write(body)
     subprocess.run(["/usr/bin/open", "-a", _terminal_app(), path], capture_output=True, timeout=10)
 
 
-def run_interactive(cmd: list[str], title: str) -> None:
+def run_interactive(cmd: list[str], title: str, after: list[str] | None = None) -> None:
     """Run `cmd` in the current terminal if we have one, else open a new one."""
     if sys.stdin.isatty():
         print(f"$ {' '.join(shlex.quote(c) for c in cmd)}")
+        if after:
+            rc = subprocess.run(cmd).returncode
+            subprocess.run(after)
+            sys.exit(rc)
         os.execvp(cmd[0], cmd)
-    open_in_terminal(cmd, title)
+    open_in_terminal(cmd, title, after)
 
 
 def notify(message: str, title: str = "Baseten Monitor") -> None:
@@ -1837,7 +1880,13 @@ def action(name: str, instance_id: str, host: str = "") -> None:
         return
 
     if name == "--aws-login":
-        run_interactive(aws_login_cmd(cfg), "AWS sign in")
+        # Once the login finishes, restart the stream so the menu re-polls EC2
+        # right away instead of waiting for the next scheduled poll.
+        run_interactive(aws_login_cmd(cfg), "AWS sign in", after=REFRESH_SELF)
+        return
+
+    if name == "--aws-configure-sso":
+        run_interactive(aws_configure_sso_cmd(cfg), "AWS SSO setup", after=REFRESH_SELF)
         return
 
     if name == "--aws-usage-interval":
@@ -1944,8 +1993,16 @@ def setup() -> None:
         if code == 0:
             break
         if _looks_like_auth_error(stderr) and attempt == 0:
+            if not profile_uses_sso(cfg):
+                print("Not signed in.")
+                print("If your org uses IAM Identity Center (a start URL like https://xxx.awsapps.com/start),")
+                print("answer y to run `aws configure sso`, which asks for that URL and writes it to ~/.aws/config.")
+                ans = input("Set up SSO sign-in now? [y/N] ").strip().lower()
+                if ans == "y":
+                    subprocess.run(aws_configure_sso_cmd(cfg))
+                    continue
             login = aws_login_cmd(cfg)
-            print(f"Not signed in. Running: {' '.join(login)}")
+            print(f"Running: {' '.join(login)}")
             subprocess.run(login)
             continue
         print(f"aws failed: {stderr.strip()[-300:]}")
@@ -2036,7 +2093,7 @@ if __name__ == "__main__":
         action(args[0], args[1], args[2] if len(args) == 3 else "")
     elif len(args) == 2 and args[0] == "--open-wandb":
         open_wandb_run(args[1])
-    elif args in (["--aws-login"], ["--aws-unpin"]):
+    elif args in (["--aws-login"], ["--aws-unpin"], ["--aws-configure-sso"]):
         action(args[0], "")
     elif args == ["--aws-setup"]:
         if sys.stdin.isatty():
